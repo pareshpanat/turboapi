@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "turboapi"
+name = "py-turbo-api"
 version = "1.0.0"
 description = "TurboAPI - a high-performance ASGI framework with compiled routing, DI, validation, and OpenAPI."
 readme = "README.md"
@@ -40,7 +40,7 @@ packages = ["turbo"]
 pythonpath = ["."]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_unused_ignores = true
 ignore_missing_imports = true
 check_untyped_defs = true
