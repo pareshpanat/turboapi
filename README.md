@@ -1,6 +1,6 @@
-# TurboAPI
+# py-turbo-api
 
-TurboAPI is a small, fast ASGI web framework built from scratch (stdlib-only) with a focus on predictable performance.
+py-turbo-api is a small, fast ASGI web framework built from scratch (stdlib-only) with a focus on predictable performance.
 
 ## Features
 - Trie router with `{param}` path params
