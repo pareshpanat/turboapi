@@ -7,7 +7,7 @@ name = "turboapi"
 version = "1.0.0"
 description = "TurboAPI - a high-performance ASGI framework with compiled routing, DI, validation, and OpenAPI."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Paresh Panat" }]
