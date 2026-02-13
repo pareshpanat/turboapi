@@ -80,8 +80,81 @@ jobs:
         with:
           name: dist
           path: dist
+      - name: Verify tag matches pyproject version
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          pyproject = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          match = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"\s*$', pyproject)
+          if not match:
+              print("Could not read [project].version from pyproject.toml")
+              sys.exit(1)
+          project_version = match.group(1)
+
+          tag = "${{ github.ref_name }}"
+          if not tag.startswith("v"):
+              print(f"Tag '{tag}' is invalid for this workflow; expected vX.Y.Z")
+              sys.exit(1)
+          tag_version = tag[1:]
+
+          if tag_version != project_version:
+              print(
+                  f"Tag/version mismatch: tag is {tag_version}, "
+                  f"but pyproject.toml version is {project_version}."
+              )
+              sys.exit(1)
+
+          print(f"Tag/version check passed: {tag_version}")
+          PY
+      - name: Verify release version is not already on PyPI
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import urllib.error
+          import urllib.request
+          import re
+          import sys
+
+          files = [p.name for p in pathlib.Path("dist").glob("py_turbo_api-*") if p.is_file()]
+          if not files:
+              print("No release artifacts found in dist/")
+              sys.exit(1)
+
+          match = re.match(r"^py_turbo_api-(.+?)-", files[0])
+          if not match:
+              print("Could not infer version from artifact name:", files[0])
+              sys.exit(1)
+          version = match.group(1)
+
+          url = "https://pypi.org/pypi/py-turbo-api/json"
+          try:
+              with urllib.request.urlopen(url, timeout=15) as resp:
+                  payload = json.load(resp)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  print("Project not found on PyPI yet; proceeding.")
+                  sys.exit(0)
+              raise
+
+          releases = payload.get("releases", {})
+          if version in releases and releases[version]:
+              print(
+                  f"Release {version} already exists on PyPI. "
+                  "PyPI does not allow replacing/deleting and re-uploading the same filename/version. "
+                  "Bump version in pyproject.toml, rebuild, and publish again."
+              )
+              sys.exit(1)
+
+          print(f"Version {version} is not present on PyPI; proceeding with publish.")
+          PY
       - name: Sanitize publish artifact set
         run: |
           find dist -type f ! -name 'py_turbo_api-*' -delete
           ls -la dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
