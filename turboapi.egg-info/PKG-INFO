@@ -1,0 +1,96 @@
+Metadata-Version: 2.4
+Name: turboapi
+Version: 1.0.0
+Summary: TurboAPI - a high-performance ASGI framework with compiled routing, DI, validation, and OpenAPI.
+Author: Paresh Panat
+License-Expression: Apache-2.0
+Project-URL: Homepage, https://github.com/pareshpanat/turboapi
+Project-URL: Repository, https://github.com/pareshpanat/turboapi
+Project-URL: Issues, https://github.com/pareshpanat/turboapi/issues
+Keywords: asgi,web,framework,api,openapi,performance
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Internet :: WWW/HTTP
+Classifier: Topic :: Software Development :: Libraries
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+License-File: NOTICE
+Provides-Extra: dev
+Requires-Dist: uvicorn>=0.23; extra == "dev"
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-cov>=5; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
+Requires-Dist: mypy>=1.10; extra == "dev"
+Provides-Extra: security
+Requires-Dist: PyJWT[crypto]>=2.8; extra == "security"
+Dynamic: license-file
+
+# TurboAPI
+
+TurboAPI is a small, fast ASGI web framework built from scratch (stdlib-only) with a focus on predictable performance.
+
+## Features
+- Trie router with `{param}` path params
+- `APIRouter` composition with prefixes/tags via `include_router()`
+- Compiled route plans (signature inspection happens at route registration, not per request)
+- Dependency injection with `Depends()` including nested and yield-based dependencies
+- Parameter source markers: `Query`, `Header`, `Cookie`, `Form`, `File`
+- Built-in validation with `Model` + `field()` (supports `Annotated`, `Literal`, `Enum`, `datetime`, `UUID`, `Decimal`)
+- Multipart/form-data parsing with `UploadFile`
+- Multipart hardening: per-file/part/field limits + upload spooling to disk
+- `StreamingResponse`, `FileResponse`, `BackgroundTask`, and static file mounting
+- Response primitives: `RedirectResponse`, `NegotiatedResponse`, cache header helpers, and `EventSourceResponse` for SSE
+- File hardening: `ETag`/`If-None-Match` + byte range (`206`/`416`) support
+- WebSocket route support via `@app.websocket(...)`
+- Sub-app mounting via `app.mount("/prefix", sub_app)` and host routing via `app.mount_host("*.example.com", app)`
+- WebSocket auth helpers (`websocket_token_auth`, `websocket_jwt_auth`) and OpenAPI WS extension docs (`x-turbo-websockets`)
+- Security primitives: `api_key_auth()`, `bearer_auth()`, `jwt_auth()`, OAuth2 password/auth-code/client-credentials helpers with OpenAPI security schemas
+- Session + CSRF protection primitives (`SessionMiddleware`, `CSRFMiddleware`, CSRF helpers)
+- OpenAPI at `/openapi.json`
+- Swagger UI at `/docs` and ReDoc at `/redoc`
+- Lifespan startup/shutdown handlers
+- Custom exception handlers with `@app.exception_handler(...)`
+- Reliability defaults: request timeout, max body size, max concurrency
+- Runtime settings model (`TurboSettings`) + `Turbo.from_env()` for env-driven deploy config
+- Graceful shutdown request draining (`shutdown_drain_timeout`)
+- CI release gates: Python matrix tests/lint + package build and `twine check`, with trusted publishing workflow
+- Benchmark suite + perf regression gates in CI (`benchmarks/bench_runtime.py`)
+
+## Stability
+- Compatibility policy: `API_COMPATIBILITY.md`
+- Current status: pre-1.0 (public API is stabilizing toward `v1.0.0`)
+
+## Install
+```bash
+pip install -e ".[dev]"
+```
+
+## Run example
+```bash
+uvicorn examples.app:app --reload
+```
+
+Open:
+- http://127.0.0.1:8000/docs
+- http://127.0.0.1:8000/openapi.json
+
+## Documentation Tracks
+- Tutorial: `docs/tutorial.md`
+- Advanced: `docs/advanced.md`
+- Deployment: `docs/deployment.md`
+- Security recipes: `docs/security-recipes.md`
+- Why TurboAPI + benchmark method: `docs/why-turboapi.md`
+
+## Benchmarks
+```bash
+python benchmarks/bench_runtime.py --baseline benchmarks/baseline.json --tolerance 1.20 --gate
+```
+
+## License
+Apache-2.0 (see LICENSE).

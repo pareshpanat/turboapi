@@ -1,0 +1,10 @@
+{
+  "cases": {
+    "http_plain_json": {
+      "max_mean_us": 1600.0
+    },
+    "http_with_asgi_middleware": {
+      "max_mean_us": 1900.0
+    }
+  }
+}
