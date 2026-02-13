@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py-turbo-api"
-version = "1.0.0"
+version = "1.0.1"
 description = "TurboAPI - a high-performance ASGI framework with compiled routing, DI, validation, and OpenAPI."
 readme = "README.md"
 requires-python = ">3.10"
