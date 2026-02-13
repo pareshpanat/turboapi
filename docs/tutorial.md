@@ -1,6 +1,6 @@
 # TurboAPI Tutorial
 
-This track is the quickest path from `pip install` to a production-ready CRUD API.
+This track is the quickest path from `pip install py-turbo-api` to a production-ready CRUD API.
 
 ## 1. First app
 - Create `app.py`
@@ -41,3 +41,4 @@ This track is the quickest path from `pip install` to a production-ready CRUD AP
 - Build lightweight ASGI event tests for route behavior
 - Add validation and security-path tests
 - Run `pytest -q`
+
