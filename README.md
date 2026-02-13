@@ -1,6 +1,6 @@
 # py-turbo-api
 
-py-turbo-api is a small, fast ASGI web framework built from scratch (stdlib-only) with a focus on predictable performance.
+TurboAPI is a small, fast ASGI web framework built from scratch (stdlib-only) with a focus on predictable performance.
 
 ## Features
 - Trie router with `{param}` path params
@@ -42,14 +42,9 @@ pip install py-turbo-api
 
 PyPI: https://pypi.org/project/py-turbo-api/
 
-### For local development
-```bash
-pip install -e ".[dev]"
-```
-
 ## Run example
 ```bash
-uvicorn examples.app:app --reload
+uvicorn app:app --reload
 ```
 
 Open:
