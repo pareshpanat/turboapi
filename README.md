@@ -34,6 +34,15 @@ py-turbo-api is a small, fast ASGI web framework built from scratch (stdlib-only
 - Current status: pre-1.0 (public API is stabilizing toward `v1.0.0`)
 
 ## Install
+
+### From PyPI
+```bash
+pip install py-turbo-api
+```
+
+PyPI: https://pypi.org/project/py-turbo-api/
+
+### For local development
 ```bash
 pip install -e ".[dev]"
 ```
