@@ -31,7 +31,7 @@ TurboAPI is a small, fast ASGI web framework built from scratch (stdlib-only) wi
 
 ## Stability
 - Compatibility policy: `API_COMPATIBILITY.md`
-- Current status: pre-1.0 (public API is stabilizing toward `v1.0.0`)
+- Current status: pre-1.0 (public API is stabilizing toward `v1.1.0`)
 
 ## Install
 
