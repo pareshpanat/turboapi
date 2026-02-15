@@ -52,6 +52,8 @@ Open:
 - http://127.0.0.1:8000/openapi.json
 
 ## Documentation Tracks
+- Docs home (GitHub Pages entry): `docs/index.md`
+- Complete API reference: `docs/api-reference.md`
 - Tutorial: `docs/tutorial.md`
 - Advanced: `docs/advanced.md`
 - Deployment: `docs/deployment.md`
