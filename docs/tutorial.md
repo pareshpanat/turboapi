@@ -65,7 +65,7 @@ async def get_todo(todo_id: int):
 ## 3. Query, header, and dependency injection
 
 ```python
-from turbo import Depends, Query, Header
+from turbo import APIRouter, Depends, Query, Header
 
 def require_api_version(x_api_version: str = Header(alias="x-api-version")):
     if x_api_version != "2026-01":
@@ -78,6 +78,20 @@ async def search(
     version: str = Depends(require_api_version),
 ):
     return {"q": q, "api_version": version}
+
+# App-level dependency (runs on every route)
+async def mark_request(req):
+    req.app.state.total_requests = int(req.app.state.get("total_requests", 0)) + 1
+    req.state.request_number = req.app.state.total_requests
+
+app = Turbo(dependencies=[Depends(mark_request)])
+
+# Router-level + include-time dependencies
+router = APIRouter(prefix="/v1")
+@router.get("/items", dependencies=[Depends(require_api_version)])
+async def list_items():
+    return {"ok": True}
+app.include_router(router, dependencies=[Depends(require_api_version)])
 ```
 
 ## 4. Security (API key example)
@@ -109,7 +123,36 @@ You can tune runtime limits in `Turbo(...)`:
 - `max_concurrency`
 - multipart limits (`multipart_max_fields`, `multipart_max_file_size`, `multipart_spool_threshold`, `multipart_max_part_size`)
 
-## 6. WebSocket endpoint
+## 6. Lifespan state resources and job queue
+
+```python
+from turbo import InMemoryJobQueue, RetryPolicy, app_state_dependency
+
+jobs = InMemoryJobQueue()
+
+async def start_jobs(app):
+    jobs.register("email.send", lambda payload: {"to": payload["to"]})
+    await jobs.start(workers=1)
+    return jobs
+
+async def stop_jobs(queue, app):
+    await queue.stop()
+
+app.add_state_resource("jobs", start_jobs, cleanup=stop_jobs)
+
+@app.post("/jobs/email")
+async def queue_email(jobs=app_state_dependency("jobs", expected_type=InMemoryJobQueue)):
+    job_id = await jobs.enqueue(
+        "email.send",
+        {"to": "dev@example.com"},
+        delay_seconds=0.2,
+        retry=RetryPolicy(max_retries=2, base_delay=0.1),
+        idempotency_key="email:dev@example.com",
+    )
+    return {"job_id": job_id}
+```
+
+## 7. WebSocket endpoint
 
 ```python
 from turbo import WebSocket
@@ -122,11 +165,12 @@ async def ws_echo(ws: WebSocket):
         await ws.send_text(f"echo:{msg}")
 ```
 
-## 7. Testing with `TestClient`
+## 8. Testing with `TestClient` and `AsyncTestClient`
 
 ```python
-from turbo import TestClient
+from turbo import AsyncTestClient, TestClient
 from app import app
+import asyncio
 
 def test_ping():
     c = TestClient(app)
@@ -139,6 +183,15 @@ def test_create_todo():
     r = c.post("/todos", json_body={"title": "write docs"})
     assert r.status_code == 201
     assert r.json()["title"] == "write docs"
+
+def test_ws_async():
+    async def scenario():
+        async with AsyncTestClient(app) as c:
+            ws = await c.websocket_connect("/ws")
+            await ws.send_text("hi")
+            assert (await ws.receive_text()) == "echo:hi"
+            await ws.close()
+    asyncio.run(scenario())
 ```
 
 Run tests:
@@ -147,7 +200,26 @@ Run tests:
 pytest -q
 ```
 
-## 8. Next docs
+## 9. Optional: Pydantic v2 models
+
+If installed, you can use `pydantic.BaseModel` for request and response models.
+
+```bash
+pip install "py-turbo-api[pydantic]"
+```
+
+```python
+from pydantic import BaseModel
+
+class TodoIn(BaseModel):
+    title: str
+
+class TodoOut(BaseModel):
+    id: int
+    title: str
+```
+
+## 10. Next docs
 
 - Full symbol-level API: `api-reference.md`
 - Security patterns: `security-recipes.md`

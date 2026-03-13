@@ -2,6 +2,8 @@ from turbo import (
     APIRouter,
     BackgroundTask,
     Body,
+    ClassDepends,
+    CompressionMiddleware,
     ConnectionManager,
     CORSMiddleware,
     CSRFMiddleware,
@@ -12,6 +14,7 @@ from turbo import (
     HTTPError,
     Header,
     Host,
+    InMemoryJobQueue,
     MemorySessionBackend,
     MetricsMiddleware,
     Model,
@@ -19,14 +22,17 @@ from turbo import (
     PrometheusMiddleware,
     ProxyHeadersMiddleware,
     Query,
+    RateLimitMiddleware,
     RedirectResponse,
     Request,
+    ResponseCacheMiddleware,
     RequestIDMiddleware,
     SSEEvent,
     Security,
     SessionMiddleware,
     StreamingResponse,
     StructuredLoggingMiddleware,
+    TestClient,
     TrustedHostMiddleware,
     Turbo,
     WebSocket,
@@ -42,6 +48,9 @@ from turbo import (
     oauth2_client_credentials,
     websocket_token_auth,
     with_cache_headers,
+    app_state_dependency,
+    RetryPolicy,
+    dependency_group,
 )
 
 
@@ -51,6 +60,12 @@ from turbo import (
 async def allow_docs(req: Request):
     # Optional docs auth gate. Return False to block /docs and /schema.
     return req.headers.get("x-docs-token") == "demo-docs"
+
+
+async def touch_request_state(req: Request):
+    req.app.state.request_count = int(req.app.state.get("request_count", 0)) + 1
+    req.state.request_number = req.app.state.request_count
+    return req.state.request_number
 
 
 app = Turbo(
@@ -66,12 +81,17 @@ app = Turbo(
     redoc_js_url="https://unpkg.com/redoc@2/bundles/redoc.standalone.js",
     # docs_auth=allow_docs,  # enable when you want gated docs
     operation_id_strategy="method_path",
+    dependencies=[Depends(touch_request_state)],
 )
+app.add_openapi_server("https://api.example.com", description="Production")
+app.set_openapi_reuse_parameters(True)
+app.add_openapi_security_requirement({"BearerAuth": []})
 
 api = APIRouter(prefix="/api", tags=["demo"])
 ws_manager = ConnectionManager()
 session_backend = MemorySessionBackend()
 metrics_events = []
+jobs_queue = InMemoryJobQueue()
 
 
 # Security dependency instances reused by multiple routes.
@@ -99,6 +119,29 @@ ws_token_dep = websocket_token_auth("token")
 # -------------------------------
 async def get_user_agent(req: Request):
     return req.headers.get("user-agent", "unknown")
+
+
+class RequestContext:
+    def __init__(self, req: Request, trace_id: str = Header(alias="x-trace-id", required=False)):
+        self.path = req.path
+        self.trace_id = trace_id
+
+
+async def require_client_version(x_client_version: str = Header(alias="x-client-version", required=False)):
+    return x_client_version or "unknown"
+
+
+client_meta_dependencies = dependency_group(require_client_version)
+
+
+async def start_jobs(app_ref):
+    jobs_queue.register("email.send", lambda payload: {"queued_to": payload.get("to")})
+    await jobs_queue.start(workers=1)
+    return jobs_queue
+
+
+async def stop_jobs(queue: InMemoryJobQueue, app_ref):
+    await queue.stop()
 
 
 class UserIn(Model):
@@ -153,6 +196,9 @@ app.use_asgi(
     )
 )
 app.use_asgi(GZipMiddleware(minimum_size=200))
+app.use_asgi(CompressionMiddleware(minimum_size=256, prefer=["gzip", "deflate"]))
+app.use_asgi(RateLimitMiddleware(max_requests=1000, window_seconds=60))
+app.use_asgi(ResponseCacheMiddleware(ttl_seconds=5, max_entries=256))
 app.use_asgi(TrustedHostMiddleware(["127.0.0.1", "localhost"]))
 app.use_asgi(
     SessionMiddleware(
@@ -170,6 +216,18 @@ app.use_asgi(CSRFMiddleware(cookie_name="turbo_csrf", same_site="None", https_on
 ENABLE_HTTPS_REDIRECT = False
 if ENABLE_HTTPS_REDIRECT:
     app.use_asgi(HTTPSRedirectMiddleware())
+
+app.add_state_resource("jobs", start_jobs, cleanup=stop_jobs)
+
+
+class DemoExtension:
+    name = "demo-extension"
+
+    def setup(self, app_ref):
+        app_ref.register_telemetry_exporter("demo", {"type": "stdout"})
+
+
+app.use_extension(DemoExtension())
 
 
 # -------------------------------
@@ -219,7 +277,18 @@ async def moved():
 # -------------------------------
 @app.get("/whoami", summary="Request context")
 async def whoami(req: Request):
-    return {"request_id": req.request_id, "session": req.session, "csrf_token": req.csrf_token}
+    return {
+        "request_id": req.request_id,
+        "session": req.session,
+        "csrf_token": req.csrf_token,
+        "request_number": req.state.request_number,
+        "app_request_count": req.app.state.request_count,
+    }
+
+
+@app.get("/state")
+async def state(req: Request):
+    return {"request_number": req.state.request_number, "app_request_count": req.app.state.request_count}
 
 
 @app.post("/session/login")
@@ -289,6 +358,27 @@ async def binary_note(data: bytes = Body(media_type="application/octet-stream"))
     return {"size": len(data)}
 
 
+@app.post("/jobs/email")
+async def queue_email(req: Request):
+    queue = req.app.state.jobs
+    job_id = await queue.enqueue(
+        "email.send",
+        {"to": "demo@example.com"},
+        delay_seconds=0.05,
+        retry=RetryPolicy(max_retries=2, base_delay=0.01),
+        idempotency_key="email:demo",
+    )
+    return {"job_id": job_id}
+
+
+@app.get("/jobs/{job_id}")
+async def job_status(job_id: str, queue=app_state_dependency("jobs", expected_type=InMemoryJobQueue)):
+    rec = queue.get_job(job_id)
+    if rec is None:
+        raise HTTPError(404, "Job not found")
+    return {"id": rec.id, "status": rec.status, "attempts": rec.attempts, "error": rec.error}
+
+
 # -------------------------------
 # WebSocket functionality
 # -------------------------------
@@ -328,6 +418,20 @@ async def room_chat(ws: WebSocket, room: str):
 @api.get("/hello/{name}", summary="Hello endpoint")
 async def hello(name: str, ua=Depends(get_user_agent)):
     return {"hello": name, "ua": ua}
+
+
+async def require_trace_id(trace_id: str = Header(alias="x-trace-id")):
+    return trace_id
+
+
+@api.get("/deps-demo", dependencies=[Depends(require_trace_id)])
+async def deps_demo():
+    return {"ok": True}
+
+
+@api.get("/deps-class", dependencies=[client_meta_dependencies])
+async def deps_class_demo(ctx=ClassDepends(RequestContext)):
+    return {"path": ctx.path, "trace_id": ctx.trace_id}
 
 
 @api.get("/search")
@@ -410,4 +514,15 @@ async def secure_with_oauth_client(payload=Security(oauth_client_dep, scopes=["w
     return {"auth": "oauth2_client_credentials", "claims": payload}
 
 
-app.include_router(api)
+app.include_router(api, dependencies=[Depends(get_user_agent)])
+
+
+def _demo_testclient():
+    # Lightweight local smoke for docs: python examples/app.py
+    # This keeps the example self-contained without adding a test file.
+    with TestClient(app) as client:
+        assert client.get("/ping").status_code == 200
+
+
+if __name__ == "__main__":
+    _demo_testclient()

@@ -7,10 +7,12 @@ from .errors import HTTPError
 from .request import Request, UploadFile, WebSocket
 from .utils import call_callable, run_sync
 
-def _param_error(source: str, name: str, msg: str, typ: str, ctx: Optional[dict[str, Any]] = None):
+def _param_error(source: str, name: str, msg: str, typ: str, ctx: Optional[dict[str, Any]] = None, input_value: Any = None):
     err = {"loc": [source, name], "msg": msg, "type": typ}
     if ctx:
         err["ctx"] = ctx
+    if input_value is not None:
+        err["input"] = input_value
     raise HTTPError(422, "Validation Error", {"errors": [err]})
 
 @dataclass(frozen=True, slots=True)
@@ -19,8 +21,30 @@ class Depends:
     cache: bool = True
     scopes: Optional[list[str]] = None
 
+@dataclass(frozen=True, slots=True)
+class DependencyGroup:
+    dependencies: tuple["Depends", ...]
+
 def Security(call: Callable[..., Any], *, scopes: Optional[list[str]] = None, cache: bool = True):
     return Depends(call=call, cache=cache, scopes=list(scopes or []))
+
+def ClassDepends(cls: type, *, cache: bool = True):
+    return Depends(call=cls, cache=cache)
+
+def dependency_group(*items: Any):
+    deps: list[Depends] = []
+    for item in items:
+        if isinstance(item, Depends):
+            deps.append(item)
+            continue
+        if isinstance(item, DependencyGroup):
+            deps.extend(item.dependencies)
+            continue
+        if callable(item):
+            deps.append(Depends(item))
+            continue
+        raise TypeError("dependency_group accepts Depends, DependencyGroup, or callables")
+    return DependencyGroup(tuple(deps))
 
 @dataclass(frozen=True, slots=True)
 class Param:
@@ -29,27 +53,32 @@ class Param:
     required: bool = True
     media_type: Optional[str] = None
     embed: Optional[bool] = None
+    description: Optional[str] = None
+    example: Any = None
+    examples: Optional[dict[str, Any]] = None
+    deprecated: bool = False
+    schema: Optional[dict[str, Any]] = None
 
-def Query(*, alias: Optional[str] = None, required: bool = True):
-    return Param(source="query", alias=alias, required=required)
+def Query(*, alias: Optional[str] = None, required: bool = True, description: Optional[str] = None, example: Any = None, examples: Optional[dict[str, Any]] = None, deprecated: bool = False, schema: Optional[dict[str, Any]] = None):
+    return Param(source="query", alias=alias, required=required, description=description, example=example, examples=examples, deprecated=deprecated, schema=schema)
 
-def Header(*, alias: Optional[str] = None, required: bool = True):
-    return Param(source="header", alias=alias, required=required)
+def Header(*, alias: Optional[str] = None, required: bool = True, description: Optional[str] = None, example: Any = None, examples: Optional[dict[str, Any]] = None, deprecated: bool = False, schema: Optional[dict[str, Any]] = None):
+    return Param(source="header", alias=alias, required=required, description=description, example=example, examples=examples, deprecated=deprecated, schema=schema)
 
-def Cookie(*, alias: Optional[str] = None, required: bool = True):
-    return Param(source="cookie", alias=alias, required=required)
+def Cookie(*, alias: Optional[str] = None, required: bool = True, description: Optional[str] = None, example: Any = None, examples: Optional[dict[str, Any]] = None, deprecated: bool = False, schema: Optional[dict[str, Any]] = None):
+    return Param(source="cookie", alias=alias, required=required, description=description, example=example, examples=examples, deprecated=deprecated, schema=schema)
 
-def Form(*, alias: Optional[str] = None, required: bool = True):
-    return Param(source="form", alias=alias, required=required)
+def Form(*, alias: Optional[str] = None, required: bool = True, description: Optional[str] = None, example: Any = None, examples: Optional[dict[str, Any]] = None, deprecated: bool = False, schema: Optional[dict[str, Any]] = None):
+    return Param(source="form", alias=alias, required=required, description=description, example=example, examples=examples, deprecated=deprecated, schema=schema)
 
-def File(*, alias: Optional[str] = None, required: bool = True):
-    return Param(source="file", alias=alias, required=required)
+def File(*, alias: Optional[str] = None, required: bool = True, description: Optional[str] = None, example: Any = None, examples: Optional[dict[str, Any]] = None, deprecated: bool = False, schema: Optional[dict[str, Any]] = None):
+    return Param(source="file", alias=alias, required=required, description=description, example=example, examples=examples, deprecated=deprecated, schema=schema)
 
-def Host(*, alias: Optional[str] = None, required: bool = True):
-    return Param(source="host", alias=alias, required=required)
+def Host(*, alias: Optional[str] = None, required: bool = True, description: Optional[str] = None, example: Any = None, examples: Optional[dict[str, Any]] = None, deprecated: bool = False, schema: Optional[dict[str, Any]] = None):
+    return Param(source="host", alias=alias, required=required, description=description, example=example, examples=examples, deprecated=deprecated, schema=schema)
 
-def Body(*, alias: Optional[str] = None, required: bool = True, media_type: Optional[str] = None, embed: Optional[bool] = None):
-    return Param(source="body", alias=alias, required=required, media_type=media_type, embed=embed)
+def Body(*, alias: Optional[str] = None, required: bool = True, media_type: Optional[str] = None, embed: Optional[bool] = None, description: Optional[str] = None, example: Any = None, examples: Optional[dict[str, Any]] = None, schema: Optional[dict[str, Any]] = None):
+    return Param(source="body", alias=alias, required=required, media_type=media_type, embed=embed, description=description, example=example, examples=examples, schema=schema)
 
 @dataclass(slots=True)
 class ParamSpec:
@@ -148,7 +177,7 @@ async def _read_param_value(spec: ParamSpec, *, req: Request, receive, path: Dic
         try:
             return cast_scalar(path[alias], ann)
         except ValueError:
-            _param_error("path", alias, "Invalid parameter type", "type_error.path", {"expected": str(ann)})
+            _param_error("path", alias, "Invalid parameter type", "type_error.path", {"expected": str(ann)}, input_value=path.get(alias))
     if source == "query":
         vals = query_multi.get(alias)
         if vals is None:
@@ -158,7 +187,7 @@ async def _read_param_value(spec: ParamSpec, *, req: Request, receive, path: Dic
         try:
             return cast_scalar(vals if _is_list_annotation(ann) else vals[0], ann)
         except ValueError:
-            _param_error("query", alias, "Invalid parameter type", "type_error.query", {"expected": str(ann)})
+            _param_error("query", alias, "Invalid parameter type", "type_error.query", {"expected": str(ann)}, input_value=vals if _is_list_annotation(ann) else vals[0])
     if source == "header":
         key = _as_header_key(alias)
         vals = headers_multi.get(key)
@@ -169,7 +198,7 @@ async def _read_param_value(spec: ParamSpec, *, req: Request, receive, path: Dic
         try:
             return cast_scalar(vals if _is_list_annotation(ann) else vals[-1], ann)
         except ValueError:
-            _param_error("header", alias, "Invalid parameter type", "type_error.header", {"expected": str(ann)})
+            _param_error("header", alias, "Invalid parameter type", "type_error.header", {"expected": str(ann)}, input_value=vals if _is_list_annotation(ann) else vals[-1])
     if source == "cookie":
         val = cookies.get(alias)
         if val is None:
@@ -179,7 +208,7 @@ async def _read_param_value(spec: ParamSpec, *, req: Request, receive, path: Dic
         try:
             return cast_scalar(val, ann)
         except ValueError:
-            _param_error("cookie", alias, "Invalid parameter type", "type_error.cookie", {"expected": str(ann)})
+            _param_error("cookie", alias, "Invalid parameter type", "type_error.cookie", {"expected": str(ann)}, input_value=val)
     if source == "host":
         vals = headers_multi.get("host")
         if vals is None or not vals:
@@ -190,7 +219,7 @@ async def _read_param_value(spec: ParamSpec, *, req: Request, receive, path: Dic
         try:
             return cast_scalar(host, ann)
         except ValueError:
-            _param_error("header", "host", "Invalid parameter type", "type_error.header", {"expected": str(ann)})
+            _param_error("header", "host", "Invalid parameter type", "type_error.header", {"expected": str(ann)}, input_value=host)
     if source in ("form", "file"):
         form_multi = await req.form_multi(receive)
         vals = form_multi.get(alias)
@@ -209,7 +238,7 @@ async def _read_param_value(spec: ParamSpec, *, req: Request, receive, path: Dic
         try:
             return cast_scalar(vals if _is_list_annotation(ann) else vals[0], ann)
         except ValueError:
-            _param_error("form", alias, "Invalid parameter type", "type_error.form", {"expected": str(ann)})
+            _param_error("form", alias, "Invalid parameter type", "type_error.form", {"expected": str(ann)}, input_value=vals if _is_list_annotation(ann) else vals[0])
     if source == "body":
         if body_cache_ref["value"] is None:
             if validate_body_fn:
@@ -328,3 +357,73 @@ def _enforce_scopes(dep: Depends, value: Any):
     missing = sorted(wanted - have)
     if missing:
         raise HTTPError(403, "Insufficient scope", {"required": sorted(wanted), "missing": missing})
+
+
+def build_dependency_graph(call: Callable[..., Any], *, max_depth: int = 32):
+    seen: set[Callable[..., Any]] = set()
+
+    def walk(fn: Callable[..., Any], depth: int):
+        if depth > max_depth:
+            return {"name": getattr(fn, "__name__", repr(fn)), "kind": "callable", "truncated": True, "deps": []}
+        if fn in seen:
+            return {"name": getattr(fn, "__name__", repr(fn)), "kind": "callable", "cycle": True, "deps": []}
+        seen.add(fn)
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+        except (TypeError, ValueError):
+            params = {}
+        node = {
+            "name": getattr(fn, "__name__", repr(fn)),
+            "kind": "callable",
+            "deps": [],
+            "params": [],
+        }
+        for p in params.values():
+            default = p.default
+            if isinstance(default, Depends):
+                child = walk(default.call, depth + 1)
+                child["scopes"] = list(default.scopes or [])
+                child["cache"] = bool(default.cache)
+                node["deps"].append(child)
+            else:
+                node["params"].append({
+                    "name": p.name,
+                    "annotation": str(p.annotation),
+                    "kind": p.kind.name.lower(),
+                    "has_default": default is not inspect._empty,
+                })
+        return node
+
+    return walk(call, 0)
+
+
+def format_dependency_graph(graph: dict[str, Any]):
+    lines: list[str] = []
+
+    def render_name(node: dict[str, Any]):
+        name = node.get("name", "<callable>")
+        flags = []
+        if node.get("cycle"):
+            flags.append("cycle")
+        if node.get("truncated"):
+            flags.append("truncated")
+        if node.get("scopes"):
+            flags.append(f"scopes={node.get('scopes')}")
+        if "cache" in node:
+            flags.append(f"cache={node.get('cache')}")
+        return f"{name}" + (f" ({', '.join(flags)})" if flags else "")
+
+    def walk(node: dict[str, Any], prefix: str = "", is_last: bool = True, is_root: bool = False):
+        if is_root:
+            lines.append(render_name(node))
+        else:
+            branch = "`-- " if is_last else "|-- "
+            lines.append(prefix + branch + render_name(node))
+        deps = node.get("deps", []) or []
+        child_prefix = prefix + ("    " if is_last else "|   ")
+        for idx, child in enumerate(deps):
+            walk(child, child_prefix, idx == len(deps) - 1, is_root=False)
+
+    walk(graph, is_root=True)
+    return "\n".join(lines)

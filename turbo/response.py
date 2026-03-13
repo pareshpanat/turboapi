@@ -11,6 +11,7 @@ from email.utils import formatdate
 from enum import Enum
 from typing import Iterable, Tuple, Union, Optional, Any, Callable
 from uuid import UUID
+from .pydantic_compat import is_pydantic_model_instance, dump_pydantic_model
 
 Headers = Iterable[Tuple[bytes, bytes]]
 Body = Union[bytes, bytearray, memoryview]
@@ -43,6 +44,8 @@ def to_jsonable(value: Any, *, encoders: Optional[dict[type, Encoder]] = None):
         return {str(k): to_jsonable(v, encoders=encoders) for k, v in value.items()}
     if is_dataclass(value) and not isinstance(value, type):
         return to_jsonable(asdict(value), encoders=encoders)
+    if is_pydantic_model_instance(value):
+        return to_jsonable(dump_pydantic_model(value), encoders=encoders)
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if isinstance(value, UUID):

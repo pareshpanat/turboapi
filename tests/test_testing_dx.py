@@ -59,3 +59,36 @@ def test_testclient_cookie_and_session_roundtrip():
         me = client.get("/me")
         assert me.status_code == 200
         assert me.json()["user"] == "alice"
+
+
+def test_request_and_app_state():
+    app = Turbo()
+    app.state.counter = 0
+    app.state.label = "turbo"
+
+    @app.get("/state")
+    async def state(req: Request):
+        had_local = hasattr(req.state, "local")
+        req.state.local = "only-this-request"
+        req.app.state.counter += 1
+        return {
+            "label": req.app.state.label,
+            "counter": req.app.state.counter,
+            "had_local": had_local,
+            "local": req.state.local,
+        }
+
+    with TestClient(app) as client:
+        r1 = client.get("/state")
+        assert r1.status_code == 200
+        b1 = r1.json()
+        assert b1["label"] == "turbo"
+        assert b1["counter"] == 1
+        assert b1["had_local"] is False
+        assert b1["local"] == "only-this-request"
+
+        r2 = client.get("/state")
+        assert r2.status_code == 200
+        b2 = r2.json()
+        assert b2["counter"] == 2
+        assert b2["had_local"] is False

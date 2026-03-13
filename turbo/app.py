@@ -6,17 +6,21 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 from .routing import Router
-from .request import Request, WebSocket
+from .request import Request, WebSocket, State
 from .response import Response, JSONResponse, TextResponse, HTMLResponse, FileResponse
 from .errors import HTTPError
 from .middleware import MiddlewareStack
 from .utils import timeout, call_callable
 from .deps import Depends, ParamSpec, compile_route_plan, resolve_dependencies
+from .deps import DependencyGroup, build_dependency_graph, format_dependency_graph
 from dataclasses import is_dataclass
 from .models import Model, compile_model_validator, compile_type_validator
 from .openapi import build_openapi
+from .pydantic_compat import is_pydantic_model_class, validate_pydantic_model, dump_pydantic_model
+from .extensions import setup_extension
 
 Handler = Callable[..., Awaitable[Any]]
+_STATE_MISSING = object()
 
 @dataclass(slots=True)
 class RouteDef:
@@ -41,6 +45,7 @@ class RouteDef:
     response_description: Optional[str] = None
     openapi_extra: Optional[dict[str, Any]] = None
     subprotocols: Optional[list[str]] = None
+    dependencies: Optional[list[Depends]] = None
 
 @dataclass(slots=True)
 class Route:
@@ -75,33 +80,43 @@ class Route:
     response_description: Optional[str] = None
     openapi_extra: dict[str, Any] | None = None
     subprotocols: list[str] | None = None
+    dependencies: list[Depends] | None = None
+
+
+@dataclass(slots=True)
+class StateResourceDef:
+    name: str
+    factory: Callable[..., Any]
+    cleanup: Optional[Callable[..., Any]] = None
 
 class APIRouter:
-    def __init__(self, *, prefix: str = "", tags: Optional[list[str]] = None):
+    def __init__(self, *, prefix: str = "", tags: Optional[list[str]] = None, dependencies: Optional[list[Any]] = None):
         if prefix and not prefix.startswith("/"):
             raise ValueError("prefix must start with /")
         self.prefix = prefix.rstrip("/") if prefix not in ("", "/") else ""
         self.tags = list(tags or [])
+        self.dependencies = _normalize_dependencies(dependencies)
         self._routes: list[RouteDef] = []
 
-    def route(self, method: str, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None):
+    def route(self, method: str, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None, dependencies: Optional[list[Any]] = None):
         def deco(fn: Handler):
             merged_tags = list(dict.fromkeys([*self.tags, *(tags or [])]))
-            self._routes.append(RouteDef(method=method.upper(), path=path, handler=fn, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=merged_tags or None, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra))
+            merged_dependencies = [*self.dependencies, *_normalize_dependencies(dependencies)]
+            self._routes.append(RouteDef(method=method.upper(), path=path, handler=fn, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=merged_tags or None, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra, dependencies=merged_dependencies or None))
             return fn
         return deco
 
-    def get(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None):
-        return self.route("GET", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra)
+    def get(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None, dependencies: Optional[list[Any]] = None):
+        return self.route("GET", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra, dependencies=dependencies)
 
-    def post(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None):
-        return self.route("POST", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra)
+    def post(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None, dependencies: Optional[list[Any]] = None):
+        return self.route("POST", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra, dependencies=dependencies)
 
-    def put(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None):
-        return self.route("PUT", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra)
+    def put(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None, dependencies: Optional[list[Any]] = None):
+        return self.route("PUT", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra, dependencies=dependencies)
 
-    def delete(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None):
-        return self.route("DELETE", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra)
+    def delete(self, path: str, *, name: Optional[str] = None, operation_id: Optional[str] = None, response_model: Optional[Any] = None, status_code: Optional[int] = None, include_in_schema: bool = True, internal: bool = False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None, dependencies: Optional[list[Any]] = None):
+        return self.route("DELETE", path, name=name, operation_id=operation_id, response_model=response_model, status_code=status_code, include_in_schema=include_in_schema, internal=internal, tags=tags, summary=summary, description=description, responses=responses, security=security, deprecated=deprecated, callbacks=callbacks, webhooks=webhooks, examples=examples, response_description=response_description, openapi_extra=openapi_extra, dependencies=dependencies)
 
     def patch(self, path: str, **kwargs):
         return self.route("PATCH", path, **kwargs)
@@ -118,7 +133,7 @@ class APIRouter:
         return endpoint
 
 class Turbo:
-    def __init__(self, *, request_timeout:float=10.0, max_body_bytes:int=1_000_000, max_concurrency:int=200, title:str="TurboAPI", version:str="0.1.0", multipart_max_fields:int=1000, multipart_max_file_size:int=10_000_000, multipart_spool_threshold:int=1_000_000, multipart_max_part_size:int=10_000_000, redirect_slashes: bool = True, redirect_status_code: int = 307, openapi_url: Optional[str] = "/openapi.json", docs_url: Optional[str] = "/docs", redoc_url: Optional[str] = "/redoc", swagger_js_url: str = "https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js", swagger_css_url: str = "https://unpkg.com/swagger-ui-dist@5/swagger-ui.css", redoc_js_url: str = "https://unpkg.com/redoc@2/bundles/redoc.standalone.js", docs_auth: Optional[Callable[..., Any]] = None, operation_id_strategy: str = "function", operation_id_generator: Optional[Callable[..., str]] = None, shutdown_drain_timeout: float = 10.0):
+    def __init__(self, *, request_timeout:float=10.0, max_body_bytes:int=1_000_000, max_concurrency:int=200, title:str="TurboAPI", version:str="0.1.0", multipart_max_fields:int=1000, multipart_max_file_size:int=10_000_000, multipart_spool_threshold:int=1_000_000, multipart_max_part_size:int=10_000_000, redirect_slashes: bool = True, redirect_status_code: int = 307, openapi_url: Optional[str] = "/openapi.json", docs_url: Optional[str] = "/docs", redoc_url: Optional[str] = "/redoc", swagger_js_url: str = "https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js", swagger_css_url: str = "https://unpkg.com/swagger-ui-dist@5/swagger-ui.css", redoc_js_url: str = "https://unpkg.com/redoc@2/bundles/redoc.standalone.js", docs_auth: Optional[Callable[..., Any]] = None, operation_id_strategy: str = "function", operation_id_generator: Optional[Callable[..., str]] = None, shutdown_drain_timeout: float = 10.0, dependencies: Optional[list[Any]] = None):
         self.router=Router()
         self.middleware=MiddlewareStack()
         self.request_timeout=request_timeout
@@ -155,6 +170,7 @@ class Turbo:
         self._operation_id_strategy = operation_id_strategy
         self._operation_id_generator = operation_id_generator
         self._shutdown_drain_timeout = float(shutdown_drain_timeout)
+        self.state = State()
         self._inflight_http = 0
         self._drain_event = asyncio.Event()
         self._drain_event.set()
@@ -162,6 +178,17 @@ class Turbo:
         self._asgi_app = self.middleware.build_asgi(self._dispatch_asgi)
         self._openapi_transform: Optional[Callable[[dict[str, Any]], Optional[dict[str, Any]]]] = None
         self._openapi_vendor_extensions: dict[str, Any] = {}
+        self._openapi_servers: list[dict[str, Any]] = []
+        self._openapi_security_requirements: list[dict[str, list[str]]] = []
+        self._openapi_reuse_parameters: bool = False
+        self._dependencies = _normalize_dependencies(dependencies)
+        self._extensions: dict[str, Any] = {}
+        self._auth_providers: dict[str, Any] = {}
+        self._telemetry_exporters: dict[str, Any] = {}
+        self._cache_backends: dict[str, Any] = {}
+        self._extension_hooks: list[Callable[..., Any]] = []
+        self._state_resources: list[StateResourceDef] = []
+        self._state_resource_values: list[tuple[StateResourceDef, Any]] = []
         self._install_openapi_and_docs()
 
     @classmethod
@@ -253,6 +280,10 @@ class Turbo:
 
     def _build_openapi_document(self):
         doc = build_openapi(self, title=self._title, version=self._version)
+        if self._openapi_servers:
+            doc["servers"] = list(self._openapi_servers)
+        if self._openapi_security_requirements:
+            doc["security"] = list(self._openapi_security_requirements)
         for name, value in self._openapi_vendor_extensions.items():
             doc[name] = value
         if self._openapi_transform is not None:
@@ -279,11 +310,58 @@ class Turbo:
         self._openapi_vendor_extensions.pop(name, None)
         self._openapi_cache = None
 
-    def route(self, method:str, path:str, *, name:Optional[str]=None, operation_id: Optional[str] = None, response_model:Optional[Any]=None, status_code: Optional[int] = None, include_in_schema: bool = True, internal:bool=False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None):
+    def set_openapi_servers(self, servers: list[dict[str, Any]]):
+        self._openapi_servers = [dict(x) for x in servers]
+        self._openapi_cache = None
+
+    def add_openapi_server(self, url: str, *, description: Optional[str] = None, variables: Optional[dict[str, Any]] = None):
+        item: dict[str, Any] = {"url": str(url)}
+        if description is not None:
+            item["description"] = str(description)
+        if variables is not None:
+            item["variables"] = dict(variables)
+        self._openapi_servers.append(item)
+        self._openapi_cache = None
+
+    def clear_openapi_servers(self):
+        self._openapi_servers = []
+        self._openapi_cache = None
+
+    def set_openapi_security(self, requirements: list[dict[str, list[str]]]):
+        self._openapi_security_requirements = [{str(k): [str(s) for s in v] for k, v in r.items()} for r in requirements]
+        self._openapi_cache = None
+
+    def add_openapi_security_requirement(self, requirement: dict[str, list[str]]):
+        self._openapi_security_requirements.append({str(k): [str(s) for s in v] for k, v in requirement.items()})
+        self._openapi_cache = None
+
+    def clear_openapi_security(self):
+        self._openapi_security_requirements = []
+        self._openapi_cache = None
+
+    def set_openapi_reuse_parameters(self, enabled: bool = True):
+        self._openapi_reuse_parameters = bool(enabled)
+        self._openapi_cache = None
+
+    def enable_docs_self_host(self, assets_dir: str, *, prefix: str = "/_turbo_docs_assets"):
+        root = os.path.realpath(assets_dir)
+        if not os.path.isdir(root):
+            raise ValueError("assets_dir must exist and be a directory")
+        pfx = prefix.rstrip("/") if prefix not in ("", "/") else "/_turbo_docs_assets"
+        self.mount_static(pfx, root)
+        self._swagger_js_url = f"{pfx}/swagger-ui-bundle.js"
+        self._swagger_css_url = f"{pfx}/swagger-ui.css"
+        self._redoc_js_url = f"{pfx}/redoc.standalone.js"
+        self._openapi_cache = None
+
+    def route(self, method:str, path:str, *, name:Optional[str]=None, operation_id: Optional[str] = None, response_model:Optional[Any]=None, status_code: Optional[int] = None, include_in_schema: bool = True, internal:bool=False, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, responses: Optional[dict[Any, Any]] = None, security: Optional[list[dict[str, list[str]]]] = None, deprecated: bool = False, callbacks: Optional[dict[str, Any]] = None, webhooks: Optional[dict[str, Any]] = None, examples: Optional[dict[str, Any]] = None, response_description: Optional[str] = None, openapi_extra: Optional[dict[str, Any]] = None, dependencies: Optional[list[Any]] = None):
         method=method.upper()
         def deco(fn:Handler):
             self.router.add(method, path, fn)
             specs,sig=compile_route_plan(fn, request_type=Request)
+            explicit_dependencies = [*self._dependencies, *_normalize_dependencies(dependencies)]
+            if explicit_dependencies:
+                specs = [*_dependency_specs(explicit_dependencies), *specs]
             path_params=_path_param_names(path)
             body_model = None
             request_body_type = None
@@ -348,6 +426,11 @@ class Turbo:
                         raise HTTPError(500,"Response must be a JSON object for response_model")
                     return rv(obj)
                 validate_resp=_vr
+            elif response_model is not None and is_pydantic_model_class(response_model):
+                def _vr_pyd(obj: Any):
+                    parsed = validate_pydantic_model(response_model, obj, loc_prefix=("response",))
+                    return dump_pydantic_model(parsed)
+                validate_resp = _vr_pyd
             inferred_security, security_schemes = _extract_security(specs)
             effective_security = security if security is not None else inferred_security
             r = Route(
@@ -382,6 +465,7 @@ class Turbo:
                 response_description=response_description,
                 openapi_extra=openapi_extra,
                 subprotocols=None,
+                dependencies=explicit_dependencies or None,
             )
             self._routes.append(r)
             self._route_by_handler[fn] = r
@@ -415,10 +499,13 @@ class Turbo:
             self.route(method, path, **kwargs)(endpoint)
         return endpoint
 
-    def websocket(self, path: str, *, name: Optional[str]=None, operation_id: Optional[str] = None, include_in_schema: bool = True, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, deprecated: bool = False, examples: Optional[dict[str, Any]] = None, openapi_extra: Optional[dict[str, Any]] = None, subprotocols: Optional[list[str]] = None):
+    def websocket(self, path: str, *, name: Optional[str]=None, operation_id: Optional[str] = None, include_in_schema: bool = True, tags: Optional[list[str]] = None, summary: Optional[str] = None, description: Optional[str] = None, deprecated: bool = False, examples: Optional[dict[str, Any]] = None, openapi_extra: Optional[dict[str, Any]] = None, subprotocols: Optional[list[str]] = None, dependencies: Optional[list[Any]] = None):
         def deco(fn: Handler):
             self.router.add("WS", path, fn)
             specs,sig=compile_route_plan(fn, request_type=WebSocket)
+            explicit_dependencies = [*self._dependencies, *_normalize_dependencies(dependencies)]
+            if explicit_dependencies:
+                specs = [*_dependency_specs(explicit_dependencies), *specs]
             path_params=_path_param_names(path)
             inferred_security, security_schemes = _extract_security(specs)
             r = Route(
@@ -453,6 +540,7 @@ class Turbo:
                 response_description=None,
                 openapi_extra=openapi_extra,
                 subprotocols=subprotocols,
+                dependencies=explicit_dependencies or None,
             )
             self._routes.append(r)
             self._route_by_handler[fn] = r
@@ -487,14 +575,16 @@ class Turbo:
     def mount_host(self, host_pattern: str, app: Any):
         self._host_mounts.append((host_pattern.lower(), app))
 
-    def include_router(self, router: APIRouter, *, prefix: str = "", tags: Optional[list[str]] = None):
+    def include_router(self, router: APIRouter, *, prefix: str = "", tags: Optional[list[str]] = None, dependencies: Optional[list[Any]] = None):
         base_prefix = prefix.rstrip("/") if prefix not in ("", "/") else ""
         extra_tags = list(tags or [])
+        include_dependencies = _normalize_dependencies(dependencies)
         for rd in router._routes:
             route_path = f"{router.prefix}{rd.path}"
             path = f"{base_prefix}{route_path}" or "/"
             merged_tags = list(dict.fromkeys([*(rd.tags or []), *extra_tags])) or None
-            self.route(rd.method, path, name=rd.name, operation_id=rd.operation_id, response_model=rd.response_model, status_code=rd.status_code, include_in_schema=rd.include_in_schema, internal=rd.internal, tags=merged_tags, summary=rd.summary, description=rd.description, responses=rd.responses, security=rd.security, deprecated=rd.deprecated, callbacks=rd.callbacks, webhooks=rd.webhooks, examples=rd.examples, response_description=rd.response_description, openapi_extra=rd.openapi_extra)(rd.handler)
+            merged_dependencies = [*list(rd.dependencies or []), *include_dependencies]
+            self.route(rd.method, path, name=rd.name, operation_id=rd.operation_id, response_model=rd.response_model, status_code=rd.status_code, include_in_schema=rd.include_in_schema, internal=rd.internal, tags=merged_tags, summary=rd.summary, description=rd.description, responses=rd.responses, security=rd.security, deprecated=rd.deprecated, callbacks=rd.callbacks, webhooks=rd.webhooks, examples=rd.examples, response_description=rd.response_description, openapi_extra=rd.openapi_extra, dependencies=merged_dependencies)(rd.handler)
 
     def on_event(self, event: str):
         if event not in ("startup", "shutdown"):
@@ -535,9 +625,139 @@ class Turbo:
     def clear_dependency_overrides(self):
         self.dependency_overrides.clear()
 
+    @contextmanager
+    def override_dependencies(self, overrides: dict[Callable[..., Any], Callable[..., Any]]):
+        prev = dict(self.dependency_overrides)
+        self.dependency_overrides.update(overrides)
+        try:
+            yield
+        finally:
+            self.dependency_overrides = prev
+
+    @contextmanager
+    def override_scope(self, name: str = "scope"):
+        prev = dict(self.dependency_overrides)
+        try:
+            yield {"name": name, "overrides": self.dependency_overrides}
+        finally:
+            self.dependency_overrides = prev
+
+    def add_state_resource(self, name: str, factory: Callable[..., Any], *, cleanup: Optional[Callable[..., Any]] = None):
+        if not name or not isinstance(name, str):
+            raise ValueError("resource name must be a non-empty string")
+        self._state_resources = [r for r in self._state_resources if r.name != name]
+        self._state_resources.append(StateResourceDef(name=name, factory=factory, cleanup=cleanup))
+
+    def remove_state_resource(self, name: str):
+        self._state_resources = [r for r in self._state_resources if r.name != name]
+
+    def state_dependency(self, name: str, *, default: Any = _STATE_MISSING, required: bool = True):
+        async def _dep(req: Request):
+            marker = object()
+            value = req.app.state.get(name, marker)
+            if value is marker:
+                if default is not _STATE_MISSING:
+                    return default
+                if required:
+                    raise HTTPError(500, "Missing app state", {"name": name})
+                return None
+            return value
+
+        return Depends(_dep)
+
+    def dependency_graph(self, handler: Callable[..., Any]):
+        return build_dependency_graph(handler)
+
+    def dependency_graph_for_route(self, method: str, path: str):
+        m = str(method).upper()
+        for route in self._routes:
+            if route.method == m and route.path == path:
+                return build_dependency_graph(route.handler)
+        raise KeyError(f"Route not found: {method} {path}")
+
+    def format_dependency_graph(self, handler: Callable[..., Any]):
+        return format_dependency_graph(build_dependency_graph(handler))
+
+    def use_extension(self, extension: Any, *, name: Optional[str] = None):
+        resolved_name = name or getattr(extension, "name", None) or getattr(extension, "__name__", None) or f"ext_{len(self._extensions)+1}"
+        setup_extension(extension, self)
+        self._extensions[str(resolved_name)] = extension
+        return extension
+
+    def get_extension(self, name: str):
+        return self._extensions.get(name)
+
+    def register_auth_provider(self, name: str, provider: Any):
+        self._auth_providers[name] = provider
+        return provider
+
+    def get_auth_provider(self, name: str):
+        return self._auth_providers.get(name)
+
+    def register_telemetry_exporter(self, name: str, exporter: Any):
+        self._telemetry_exporters[name] = exporter
+        return exporter
+
+    def get_telemetry_exporter(self, name: str):
+        return self._telemetry_exporters.get(name)
+
+    def register_cache_backend(self, name: str, backend: Any):
+        self._cache_backends[name] = backend
+        return backend
+
+    def get_cache_backend(self, name: str):
+        return self._cache_backends.get(name)
+
     async def _run_event_handlers(self, handlers: list[Callable[..., Any]]):
         for fn in handlers:
             await call_callable(fn)
+
+    async def _invoke_resource_factory(self, fn: Callable[..., Any]):
+        try:
+            sig = inspect.signature(fn)
+            if len(sig.parameters) == 0:
+                return await call_callable(fn)
+            return await call_callable(fn, self)
+        except (TypeError, ValueError):
+            return await call_callable(fn, self)
+
+    async def _invoke_resource_cleanup(self, fn: Callable[..., Any], value: Any):
+        try:
+            sig = inspect.signature(fn)
+            n = len(sig.parameters)
+            if n <= 1:
+                return await call_callable(fn, value)
+            return await call_callable(fn, value, self)
+        except (TypeError, ValueError):
+            return await call_callable(fn, value)
+
+    async def _startup_state_resources(self):
+        self._state_resource_values = []
+        try:
+            for res in self._state_resources:
+                value = await self._invoke_resource_factory(res.factory)
+                setattr(self.state, res.name, value)
+                self._state_resource_values.append((res, value))
+        except Exception:
+            await self._shutdown_state_resources()
+            raise
+
+    async def _shutdown_state_resources(self):
+        first_exc: Exception | None = None
+        for res, value in reversed(self._state_resource_values):
+            try:
+                if res.cleanup is not None:
+                    await self._invoke_resource_cleanup(res.cleanup, value)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                if first_exc is None:
+                    first_exc = exc
+            try:
+                delattr(self.state, res.name)
+            except Exception:
+                pass
+        self._state_resource_values = []
+        if first_exc is not None:
+            raise first_exc
 
     async def _handle_exception(self, req: Request, exc: Exception) -> Response:
         for exc_type in type(exc).mro():
@@ -603,7 +823,8 @@ class Turbo:
             dep_cache={}
             kwargs, cleanups=await resolve_dependencies(route.param_specs, req=req, receive=guarded_receive, path_param_names=route.path_param_names, validate_body_fn=route.validate_body_fn, body_param_name=route.request_body_param_name, body_param_names=route.request_body_param_names, dep_cache=dep_cache, dependency_overrides=self.dependency_overrides)
             try:
-                res = await call_callable(route.handler, **kwargs)
+                call_kwargs = {k: v for k, v in kwargs.items() if k in route.sig.parameters}
+                res = await call_callable(route.handler, **call_kwargs)
                 if route.validate_response_fn is not None:
                     if isinstance(res, Response):
                         raise HTTPError(500,"response_model cannot be used with raw Response objects")
@@ -655,6 +876,7 @@ class Turbo:
             return
 
     async def _dispatch_asgi(self, scope, receive, send):
+        scope["app"] = self
         scope_type = scope.get("type")
         if scope_type == "lifespan":
             while True:
@@ -662,14 +884,30 @@ class Turbo:
                 msg_type = msg.get("type")
                 if msg_type == "lifespan.startup":
                     try:
+                        await self._startup_state_resources()
                         await self._run_event_handlers(self._startup_handlers)
                         await send({"type": "lifespan.startup.complete"})
                     except Exception as exc:
+                        try:
+                            await self._shutdown_state_resources()
+                        except Exception:
+                            pass
                         await send({"type": "lifespan.startup.failed", "message": str(exc)})
                 elif msg_type == "lifespan.shutdown":
                     try:
                         await self._drain_inflight_requests()
-                        await self._run_event_handlers(self._shutdown_handlers)
+                        primary_exc: Exception | None = None
+                        try:
+                            await self._run_event_handlers(self._shutdown_handlers)
+                        except Exception as exc:
+                            primary_exc = exc
+                        try:
+                            await self._shutdown_state_resources()
+                        except Exception as exc:
+                            if primary_exc is None:
+                                primary_exc = exc
+                        if primary_exc is not None:
+                            raise primary_exc
                         await send({"type": "lifespan.shutdown.complete"})
                     except Exception as exc:
                         await send({"type": "lifespan.shutdown.failed", "message": str(exc)})
@@ -722,7 +960,8 @@ class Turbo:
         dep_cache = {}
         kwargs, cleanups = await resolve_dependencies(route.param_specs, req=ws, receive=receive, path_param_names=route.path_param_names, validate_body_fn=None, body_param_name=None, body_param_names=None, dep_cache=dep_cache, dependency_overrides=self.dependency_overrides)
         try:
-            await call_callable(route.handler, **kwargs)
+            call_kwargs = {k: v for k, v in kwargs.items() if k in route.sig.parameters}
+            await call_callable(route.handler, **call_kwargs)
         except HTTPError:
             await ws.close(1008)
         except Exception:
@@ -796,6 +1035,8 @@ def _is_body_candidate(spec: ParamSpec):
     if isinstance(ann, type):
         if issubclass(ann, Model):
             return True
+        if is_pydantic_model_class(ann):
+            return True
         if is_dataclass(ann):
             return True
         if _is_typed_dict_cls(ann):
@@ -835,3 +1076,24 @@ def _alternate_slash_path(path: str):
         alt = path[:-1]
         return alt or "/"
     return path + "/"
+
+
+def _normalize_dependencies(dependencies: Optional[list[Any]]) -> list[Depends]:
+    out: list[Depends] = []
+    for dep in dependencies or []:
+        if isinstance(dep, Depends):
+            out.append(dep)
+        elif isinstance(dep, DependencyGroup):
+            out.extend(list(dep.dependencies))
+        elif callable(dep):
+            out.append(Depends(dep))
+        else:
+            raise TypeError("dependencies entries must be Depends(...) or callables")
+    return out
+
+
+def _dependency_specs(dependencies: list[Depends]) -> list[ParamSpec]:
+    out: list[ParamSpec] = []
+    for idx, dep in enumerate(dependencies):
+        out.append(ParamSpec(name=f"__dep_{idx}", kind="dep", annotation=inspect._empty, default=inspect._empty, dep=dep))
+    return out

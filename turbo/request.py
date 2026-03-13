@@ -10,6 +10,32 @@ from .errors import HTTPError
 
 MAX_QUERY_FIELDS = 2048
 
+
+class State:
+    def __init__(self):
+        self.__dict__["_store"] = {}
+
+    def __getattr__(self, name: str):
+        try:
+            return self._store[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name: str, value: Any):
+        self._store[name] = value
+
+    def __delattr__(self, name: str):
+        try:
+            del self._store[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._store
+
+    def get(self, name: str, default: Any = None):
+        return self._store.get(name, default)
+
 def _parse_content_type(value: str):
     parts = [p.strip() for p in value.split(";") if p.strip()]
     if not parts:
@@ -383,6 +409,26 @@ class Request:
     def method(self)->str: return self.scope["method"]
     @property
     def path(self)->str: return self.scope["path"]
+    @property
+    def app(self):
+        return self.scope.get("app")
+
+    @property
+    def state(self) -> State:
+        state = self.scope.get("state")
+        if state is None:
+            state = State()
+            self.scope["state"] = state
+            return state
+        if isinstance(state, State):
+            return state
+        wrapped = State()
+        if isinstance(state, dict):
+            for k, v in state.items():
+                setattr(wrapped, str(k), v)
+        self.scope["state"] = wrapped
+        return wrapped
+
     @property
     def request_id(self)->Optional[str]:
         rid = self.scope.get("turbo.request_id")

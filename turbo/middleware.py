@@ -9,6 +9,8 @@ import ipaddress
 import json
 import re
 import secrets
+import time
+import zlib
 from typing import Any, Awaitable, Callable, Optional
 
 HTTPMiddleware = Callable[..., Awaitable[Any]]
@@ -321,6 +323,276 @@ class GZipMiddleware:
             start_msg["headers"] = headers0
             await send(start_msg)
             await send({"type": "http.response.body", "body": gz, "more_body": False})
+
+        return wrapped
+
+
+class CompressionMiddleware:
+    def __init__(self, minimum_size: int = 500, *, prefer: Optional[list[str]] = None):
+        self.minimum_size = int(minimum_size)
+        self.prefer = [x.lower() for x in (prefer or ["br", "gzip", "deflate"])]
+        try:
+            import brotli  # type: ignore
+            self._brotli = brotli
+        except Exception:
+            self._brotli = None
+
+    def _select_encoding(self, accepted_encodings: str):
+        accepted = accepted_encodings.lower()
+        for name in self.prefer:
+            if name == "br" and self._brotli is not None and "br" in accepted:
+                return "br"
+            if name == "gzip" and "gzip" in accepted:
+                return "gzip"
+            if name == "deflate" and "deflate" in accepted:
+                return "deflate"
+        return None
+
+    def __call__(self, app: ASGIApp):
+        async def wrapped(scope, receive, send):
+            if scope.get("type") != "http":
+                await app(scope, receive, send)
+                return
+
+            req_headers = _headers_to_map(scope.get("headers"))
+            accepted_encodings = ",".join(req_headers.get("accept-encoding") or [])
+            encoding = self._select_encoding(accepted_encodings)
+            if encoding is None:
+                await app(scope, receive, send)
+                return
+
+            start_msg: Optional[dict[str, Any]] = None
+            body_chunks: list[bytes] = []
+            stream_more = False
+
+            async def capture_send(msg):
+                nonlocal start_msg, stream_more
+                msg_type = msg.get("type")
+                if msg_type == "http.response.start":
+                    start_msg = dict(msg)
+                    return
+                if msg_type == "http.response.body":
+                    body_chunks.append(bytes(msg.get("body", b"")))
+                    if msg.get("more_body"):
+                        stream_more = True
+                    return
+                await send(msg)
+
+            await app(scope, receive, capture_send)
+            if start_msg is None:
+                return
+
+            raw = b"".join(body_chunks)
+            status = int(start_msg.get("status", 200))
+            headers0 = list(start_msg.get("headers", []))
+            header_map = {k.lower(): v for k, v in headers0}
+            content_type = header_map.get(b"content-type", b"").decode("latin1").lower()
+
+            should_skip = (
+                stream_more
+                or len(raw) < self.minimum_size
+                or b"content-encoding" in header_map
+                or status < 200
+                or status in (204, 304)
+                or content_type.startswith("text/event-stream")
+            )
+            if should_skip:
+                await send(start_msg)
+                await send({"type": "http.response.body", "body": raw, "more_body": False})
+                return
+
+            if encoding == "br" and self._brotli is not None:
+                compressed = self._brotli.compress(raw)
+            elif encoding == "gzip":
+                compressed = gzip.compress(raw)
+            else:
+                compressed = zlib.compress(raw)
+
+            _upsert_header(headers0, b"content-encoding", encoding.encode("latin1"))
+            _append_vary(headers0, "Accept-Encoding")
+            _upsert_header(headers0, b"content-length", str(len(compressed)).encode("ascii"))
+
+            start_msg = dict(start_msg)
+            start_msg["headers"] = headers0
+            await send(start_msg)
+            await send({"type": "http.response.body", "body": compressed, "more_body": False})
+
+        return wrapped
+
+
+class RateLimitMiddleware:
+    def __init__(
+        self,
+        max_requests: int = 100,
+        window_seconds: float = 60.0,
+        *,
+        key_func: Optional[Callable[[dict], str]] = None,
+        include_headers: bool = True,
+    ):
+        self.max_requests = int(max_requests)
+        self.window_seconds = float(window_seconds)
+        self.key_func = key_func
+        self.include_headers = bool(include_headers)
+        self._counters: dict[str, tuple[int, float]] = {}
+
+    def _key(self, scope: dict):
+        if self.key_func is not None:
+            try:
+                return str(self.key_func(scope))
+            except Exception:
+                return "unknown"
+        client = scope.get("client")
+        ip = client[0] if isinstance(client, (tuple, list)) and client else "unknown"
+        path = scope.get("path", "")
+        return f"{ip}:{path}"
+
+    def __call__(self, app: ASGIApp):
+        async def wrapped(scope, receive, send):
+            if scope.get("type") != "http":
+                await app(scope, receive, send)
+                return
+
+            key = self._key(scope)
+            now = time.time()
+            count, reset_at = self._counters.get(key, (0, now + self.window_seconds))
+            if now >= reset_at:
+                count = 0
+                reset_at = now + self.window_seconds
+            if count >= self.max_requests:
+                retry_after = max(0, int(reset_at - now))
+                headers = [(b"content-type", b"application/json; charset=utf-8")]
+                if self.include_headers:
+                    headers.extend(
+                        [
+                            (b"retry-after", str(retry_after).encode("ascii")),
+                            (b"x-ratelimit-limit", str(self.max_requests).encode("ascii")),
+                            (b"x-ratelimit-remaining", b"0"),
+                            (b"x-ratelimit-reset", str(int(reset_at)).encode("ascii")),
+                        ]
+                    )
+                await send({"type": "http.response.start", "status": 429, "headers": headers})
+                await send({"type": "http.response.body", "body": b'{"error":"Too Many Requests"}'})
+                return
+            count += 1
+            self._counters[key] = (count, reset_at)
+
+            async def send_wrapper(msg):
+                if self.include_headers and msg.get("type") == "http.response.start":
+                    headers = list(msg.get("headers", []))
+                    remaining = max(0, self.max_requests - count)
+                    headers.extend(
+                        [
+                            (b"x-ratelimit-limit", str(self.max_requests).encode("ascii")),
+                            (b"x-ratelimit-remaining", str(remaining).encode("ascii")),
+                            (b"x-ratelimit-reset", str(int(reset_at)).encode("ascii")),
+                        ]
+                    )
+                    msg = dict(msg)
+                    msg["headers"] = headers
+                await send(msg)
+
+            await app(scope, receive, send_wrapper)
+
+        return wrapped
+
+
+class ResponseCacheMiddleware:
+    def __init__(
+        self,
+        ttl_seconds: float = 10.0,
+        *,
+        methods: Optional[list[str]] = None,
+        key_func: Optional[Callable[[dict], str]] = None,
+        max_entries: int = 1024,
+        cache_statuses: Optional[set[int]] = None,
+    ):
+        self.ttl_seconds = float(ttl_seconds)
+        self.methods = {m.upper() for m in (methods or ["GET", "HEAD"])}
+        self.key_func = key_func
+        self.max_entries = int(max_entries)
+        self.cache_statuses = set(cache_statuses or {200})
+        self._store: dict[str, tuple[float, int, list[tuple[bytes, bytes]], bytes]] = {}
+
+    def _key(self, scope: dict):
+        if self.key_func is not None:
+            try:
+                return str(self.key_func(scope))
+            except Exception:
+                return "__cache_key_error__"
+        method = scope.get("method", "GET")
+        path = scope.get("path", "")
+        query = scope.get("query_string", b"")
+        headers = _headers_to_map(scope.get("headers"))
+        accept = (headers.get("accept") or [""])[-1]
+        return f"{method}:{path}?{query.decode('latin1')}|accept={accept}"
+
+    def _prune(self):
+        if len(self._store) <= self.max_entries:
+            return
+        oldest_key = min(self._store.items(), key=lambda x: x[1][0])[0]
+        self._store.pop(oldest_key, None)
+
+    def __call__(self, app: ASGIApp):
+        async def wrapped(scope, receive, send):
+            if scope.get("type") != "http":
+                await app(scope, receive, send)
+                return
+            method = str(scope.get("method", "GET")).upper()
+            if method not in self.methods:
+                await app(scope, receive, send)
+                return
+            headers_map = _headers_to_map(scope.get("headers"))
+            if "authorization" in headers_map:
+                await app(scope, receive, send)
+                return
+            cache_key = self._key(scope)
+            now = time.time()
+            cached = self._store.get(cache_key)
+            if cached and cached[0] > now:
+                _expires, status, headers, body = cached
+                await send({"type": "http.response.start", "status": status, "headers": list(headers)})
+                await send({"type": "http.response.body", "body": body})
+                return
+
+            start_msg: Optional[dict[str, Any]] = None
+            body_chunks: list[bytes] = []
+            stream_more = False
+
+            async def capture_send(msg):
+                nonlocal start_msg, stream_more
+                typ = msg.get("type")
+                if typ == "http.response.start":
+                    start_msg = dict(msg)
+                    return
+                if typ == "http.response.body":
+                    body_chunks.append(bytes(msg.get("body", b"")))
+                    if msg.get("more_body"):
+                        stream_more = True
+                    return
+                await send(msg)
+
+            await app(scope, receive, capture_send)
+            if start_msg is None:
+                return
+
+            status = int(start_msg.get("status", 200))
+            headers = list(start_msg.get("headers", []))
+            body = b"".join(body_chunks)
+            header_map = {k.lower(): v for k, v in headers}
+            cache_control = header_map.get(b"cache-control", b"").decode("latin1").lower()
+            set_cookie = b"set-cookie" in header_map
+            should_cache = (
+                not stream_more
+                and status in self.cache_statuses
+                and "no-store" not in cache_control
+                and not set_cookie
+            )
+            if should_cache:
+                self._store[cache_key] = (now + self.ttl_seconds, status, headers, body)
+                self._prune()
+
+            await send(start_msg)
+            await send({"type": "http.response.body", "body": body, "more_body": False})
 
         return wrapped
 

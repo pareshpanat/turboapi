@@ -1,7 +1,7 @@
 # TurboAPI Deployment
 
 ## Runtime baseline
-- Python 3.10+
+- Python 3.11+
 - ASGI server: `uvicorn` (or equivalent)
 - Reverse proxy (Nginx/Traefik/Cloud LB) recommended
 

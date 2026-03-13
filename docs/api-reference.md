@@ -10,12 +10,14 @@ The package exports these symbols:
 - Request and WebSocket: `Request`, `WebSocket`, `UploadFile`, `ConnectionManager`, `normalize_ws_close_code`, `ws_close_reason`
 - Responses: `Response`, `JSONResponse`, `TextResponse`, `HTMLResponse`, `RedirectResponse`, `StreamingResponse`, `EventSourceResponse`, `SSEEvent`, `encode_sse_event`, `negotiate_content_type`, `NegotiatedResponse`, `build_cache_control`, `with_cache_headers`, `FileResponse`, `BackgroundTask`, `register_json_encoder`
 - Errors: `HTTPError`
-- Dependencies and params: `Depends`, `Security`, `Query`, `Header`, `Cookie`, `Form`, `File`, `Host`, `Body`
-- Validation models: `Model`, `field`, `field_validator`, `model_validator`
+- Dependencies and params: `Depends`, `Security`, `ClassDepends`, `DependencyGroup`, `dependency_group`, `Query`, `Header`, `Cookie`, `Form`, `File`, `Host`, `Body`
+- Lifespan helpers: `app_state_dependency`, `get_app_state`
+- Validation models: `Model`, `field`, `field_validator`, `model_validator`, `type_validator`
 - Security helpers: `api_key_auth`, `bearer_auth`, `jwt_auth`, `oauth2_bearer`, `oauth2_authorization_code`, `oauth2_client_credentials`, `csrf_token`, `csrf_protect`, `JWKSCache`, `websocket_token_auth`, `websocket_jwt_auth`
-- Middleware: `CORSMiddleware`, `GZipMiddleware`, `TrustedHostMiddleware`, `SessionMiddleware`, `CSRFMiddleware`, `HTTPSRedirectMiddleware`, `ProxyHeadersMiddleware`, `MemorySessionBackend`
+- Middleware: `CORSMiddleware`, `GZipMiddleware`, `CompressionMiddleware`, `RateLimitMiddleware`, `ResponseCacheMiddleware`, `TrustedHostMiddleware`, `SessionMiddleware`, `CSRFMiddleware`, `HTTPSRedirectMiddleware`, `ProxyHeadersMiddleware`, `MemorySessionBackend`
 - Observability: `RequestIDMiddleware`, `StructuredLoggingMiddleware`, `MetricsMiddleware`, `PrometheusMiddleware`, `TracingMiddleware`, `OpenTelemetryTracingHook`, `LogEvent`, `MetricEvent`, `get_request_id`, `set_request_id`
-- Testing: `TestClient`, `TestResponse`
+- Testing: `TestClient`, `AsyncTestClient`, `WebSocketTestSession`, `TestResponse`
+- Jobs: `InMemoryJobQueue`, `RetryPolicy`, `JobRecord`, `CeleryQueueAdapter`, `RQQueueAdapter`, `RedisQueueAdapter`
 
 ## Usage Quickstart
 
@@ -73,6 +75,7 @@ Turbo(
     operation_id_strategy="function",
     operation_id_generator=None,
     shutdown_drain_timeout=10.0,
+    dependencies=None,
 )
 ```
 
@@ -82,11 +85,14 @@ Main methods:
 - Router composition: `include_router`
 - Middleware: `use` (request/response middleware), `use_asgi` (ASGI middleware)
 - Mounting: `mount_static`, `mount`, `mount_host`
-- OpenAPI customization: `set_openapi_transform`, `openapi_transform`, `set_openapi_extension`, `remove_openapi_extension`, `set_operation_id_generator`
+- Lifespan resources: `add_state_resource`, `remove_state_resource`, `state_dependency`
+- OpenAPI customization: `set_openapi_transform`, `openapi_transform`, `set_openapi_extension`, `remove_openapi_extension`, `set_operation_id_generator`, `set_openapi_servers`, `add_openapi_server`, `clear_openapi_servers`, `set_openapi_security`, `add_openapi_security_requirement`, `clear_openapi_security`, `set_openapi_reuse_parameters`, `enable_docs_self_host`
 - Docs protection: `set_docs_auth`, `docs_auth`
 - Lifecycle: `on_event`, `startup`, `shutdown`
 - Error handling: `exception_handler`
-- Dependency override helpers: `override_dependency`, `clear_dependency_overrides`
+- Dependency override helpers: `override_dependency`, `override_dependencies`, `override_scope`, `clear_dependency_overrides`
+- Dependency graph helpers: `dependency_graph`, `dependency_graph_for_route`, `format_dependency_graph`
+- Extensions and registries: `use_extension`, `get_extension`, `register_auth_provider`, `get_auth_provider`, `register_telemetry_exporter`, `get_telemetry_exporter`, `register_cache_backend`, `get_cache_backend`
 - JSON encoder registration on app: `json_encoder`
 - Settings constructors: `Turbo.from_settings(...)`, `Turbo.from_env(prefix="TURBO_")`
 
@@ -99,6 +105,7 @@ Route decorator extras are available on HTTP methods and `route(...)`:
 - `responses`, `security`, `deprecated`
 - `callbacks`, `webhooks`, `examples`
 - `response_description`, `openapi_extra`
+- `dependencies` (list of `Depends(...)` or callables, executed before handler)
 
 WebSocket decorator extras on `websocket(...)`:
 
@@ -107,19 +114,24 @@ WebSocket decorator extras on `websocket(...)`:
 - `tags`, `summary`, `description`
 - `deprecated`, `examples`, `openapi_extra`
 - `subprotocols`
+- `dependencies` (list of `Depends(...)` or callables, executed before handler)
 
 ### `APIRouter`
 
 Sub-router for route grouping and composition.
 
 ```python
-APIRouter(*, prefix="", tags=None)
+APIRouter(*, prefix="", tags=None, dependencies=None)
 ```
+
+`dependencies` applies shared dependencies to all routes in the router.
 
 Methods:
 
 - `route`, `get`, `post`, `put`, `delete`, `patch`, `head`, `options`
 - `add_api_route`
+
+`include_router(router, prefix="", tags=None, dependencies=None)` can add extra dependencies to all included routes.
 
 Usage:
 
@@ -174,6 +186,8 @@ HTTP request wrapper.
 Key properties:
 
 - `method`, `path`
+- `app`
+- `state`
 - `path_params`
 - `headers`, `headers_multi`
 - `query_params`, `query_params_multi`
@@ -193,6 +207,20 @@ Methods:
 - `set_session(data)`
 - `set_session_value(key, value)`
 - `clear_session()`
+
+Notes:
+
+- `request.app` references the current `Turbo` application instance.
+- `request.state` is request-scoped mutable state.
+- `app.state` is process-scoped mutable state shared across requests.
+
+### Lifespan state helpers
+
+- `app.add_state_resource(name, factory, cleanup=None)` registers startup bootstrapping + shutdown cleanup for `app.state.<name>`.
+- `app.remove_state_resource(name)` removes a registered resource.
+- `app.state_dependency(name, default=..., required=True)` creates a dependency that reads `app.state`.
+- `app_state_dependency(name, default=..., required=True, expected_type=None)` helper version that returns `Depends(...)`.
+- `get_app_state(request, name, default=..., expected_type=None)` typed getter.
 
 ### `UploadFile`
 
@@ -291,16 +319,18 @@ Raised to return structured error responses (for example `raise HTTPError(404, "
 
 - `Depends(call, cache=True, scopes=None)`
 - `Security(call, scopes=None, cache=True)`
+- `ClassDepends(cls, cache=True)` for class-based dependency constructors.
+- `dependency_group(*items)` returns `DependencyGroup(...)` for reusable dependency sets.
 
 ### Parameter markers
 
-- `Query(alias=None, required=True)`
-- `Header(alias=None, required=True)`
-- `Cookie(alias=None, required=True)`
-- `Form(alias=None, required=True)`
-- `File(alias=None, required=True)`
-- `Host(alias=None, required=True)`
-- `Body(alias=None, required=True, media_type=None, embed=None)`
+- `Query(alias=None, required=True, description=None, example=None, examples=None, deprecated=False, schema=None)`
+- `Header(alias=None, required=True, description=None, example=None, examples=None, deprecated=False, schema=None)`
+- `Cookie(alias=None, required=True, description=None, example=None, examples=None, deprecated=False, schema=None)`
+- `Form(alias=None, required=True, description=None, example=None, examples=None, deprecated=False, schema=None)`
+- `File(alias=None, required=True, description=None, example=None, examples=None, deprecated=False, schema=None)`
+- `Host(alias=None, required=True, description=None, example=None, examples=None, deprecated=False, schema=None)`
+- `Body(alias=None, required=True, media_type=None, embed=None, description=None, example=None, examples=None, schema=None)`
 
 Example:
 
@@ -327,11 +357,16 @@ async def read_item(
 
 Typed validation and schema base class.
 
+Optional compatibility:
+
+- If `pydantic>=2` is installed, `pydantic.BaseModel` can also be used for request bodies and `response_model`.
+
 ### Field and validator decorators
 
-- `field(min_len=None, max_len=None, ge=None, le=None, regex=None, discriminator=None, alias=None)`
+- `field(min_len=None, max_len=None, ge=None, le=None, gt=None, lt=None, multiple_of=None, min_items=None, max_items=None, regex=None, discriminator=None, alias=None)`
 - `field_validator(*field_names, mode="after")`
 - `model_validator(mode="after")`
+- `type_validator(type_, mode="after")` for non-`Model` custom types.
 
 Example:
 
@@ -388,6 +423,9 @@ Add middleware via `app.use(...)` or `app.use_asgi(...)`.
 
 - `CORSMiddleware(allow_origins=None, allow_methods=None, allow_headers=None, expose_headers=None, allow_credentials=False, max_age=600, allow_origin_regex=None)`
 - `GZipMiddleware(minimum_size=500)`
+- `CompressionMiddleware(minimum_size=500, prefer=None, brotli_quality=5, gzip_level=6, deflate_level=6)`
+- `RateLimitMiddleware(max_requests=60, window_seconds=60, key_fn=None, include_headers=True)`
+- `ResponseCacheMiddleware(ttl_seconds=5, max_entries=512, methods=None, cache_statuses=None, key_fn=None, vary_headers=None)`
 - `TrustedHostMiddleware(allowed_hosts)`
 - `SessionMiddleware(secret_key, cookie_name="session", max_age=1209600, same_site="Lax", https_only=False, path="/", domain=None, http_only=True, partitioned=False, signer_salt="turbo.session", signer_digest="sha256", secret_key_fallbacks=None, backend=None, session_id_bytes=24)`
 - `CSRFMiddleware(cookie_name="csrftoken", header_name="x-csrf-token", safe_methods=None, exempt_paths=None, use_session=True, session_key="csrf_token", same_site="Lax", https_only=False, path="/", domain=None)`
@@ -431,6 +469,8 @@ Request methods:
 - `request(method, path, headers=None, params=None, json_body=None, data=None, content=None)`
 - `get`, `post`, `put`, `patch`, `delete`, `head`, `options`
 - `dependency_override(original, override)` context manager
+- `dependency_overrides({original: override, ...})` context manager
+- `override_scope(name="scope")` context manager
 
 ### `TestResponse`
 
@@ -455,7 +495,76 @@ def test_ping():
     assert resp.json() == {"ok": True}
 ```
 
-## 10. GitHub Pages Publishing
+### `AsyncTestClient`
+
+Async test client with lifespan support and HTTP/WebSocket helpers.
+
+- Async context manager: `async with AsyncTestClient(app) as client: ...`
+- HTTP methods: `request`, `get`, `post`, `put`, `patch`, `delete`, `head`, `options`
+- WebSocket helper: `await client.websocket_connect(path, headers=None, params=None, subprotocols=None)`
+- Dependency contexts: `dependency_override(...)`, `dependency_overrides(...)`, `override_scope(...)`
+
+### `WebSocketTestSession`
+
+Returned by `AsyncTestClient.websocket_connect(...)`.
+
+- Send: `send_text`, `send_bytes`, `send_json`
+- Receive: `receive`, `receive_text`, `receive_json`
+- Lifecycle: `close`
+- Properties: `accepted`, `closed`, `subprotocol`
+
+## 10. Job Queue Primitives
+
+### `InMemoryJobQueue`
+
+In-process async queue for background jobs.
+
+- Registration: `register(name, handler)`
+- Worker lifecycle: `start(workers=1)`, `stop()`, `join(timeout=None)`
+- Enqueue: `enqueue(name, payload=None, delay_seconds=None, run_at=None, retry=None, idempotency_key=None)`
+- Inspection: `get_job(job_id)`
+
+### Retry and records
+
+- `RetryPolicy(max_retries=0, base_delay=1.0, backoff=2.0, max_delay=60.0, jitter=0.0)`
+- `JobRecord(id, name, payload, run_at, status, attempts, result, error, idempotency_key, ...)`
+
+### External queue adapters
+
+- `CeleryQueueAdapter(celery_app)`
+- `RQQueueAdapter(rq_queue)`
+- `RedisQueueAdapter(redis_client, list_name="turbo:jobs")`
+## 11. Extension and Integration APIs
+
+### Extension helpers (`turbo.extensions`)
+
+- `TurboExtension` protocol (`name`, `setup(app)`)
+- `ExtensionRegistry(auth_providers, telemetry_exporters, cache_backends)`
+- `register_extension_hook(app, hook)`
+- `run_extension_hooks(app, event, **kwargs)`
+- `setup_extension(extension, app)`
+
+### Integration bridges (`turbo.integrations`)
+
+- SQLAlchemy:
+  - `create_sqlalchemy_engine(url, **kwargs)`
+  - `register_sqlalchemy(app, url, ...)`
+  - `make_sqlalchemy_session_dependency(...)`
+- Auth starter helpers:
+  - `AuthContext`
+  - `build_bearer_guard(...)`
+  - `build_scope_guard(auth_dep, required_scopes=[...])`
+- Pagination/filtering:
+  - `PageParams`
+  - `parse_pagination(...)`
+  - `apply_pagination(items, params)`
+  - `apply_sorting(items, sort=..., order=...)`
+  - `apply_filters(items, filters)`
+- Settings bridge:
+  - `load_pydantic_settings(SettingsCls, **kwargs)`
+  - `settings_dependency(SettingsCls, cache=True, **kwargs)`
+
+## 12. GitHub Pages Publishing
 
 Use `/docs` as the Pages source:
 

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import types
 from typing import Any, Dict, Set, Union, get_args, get_origin
 
 from .deps import Param
 from .models import Model, model_to_json_schema, type_to_schema
+from .pydantic_compat import is_pydantic_model_class, pydantic_model_json_schema
 from .request import UploadFile
 
 
 def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
-    components = {"schemas": {}, "securitySchemes": {}}
+    reuse_params = bool(getattr(app, "_openapi_reuse_parameters", False))
+    components = {"schemas": {}, "securitySchemes": {}, "parameters": {}}
     http_methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"}
     ws_docs: list[dict[str, Any]] = []
     seen: set[type] = set()
@@ -20,6 +24,17 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
         seen.add(m)
         return {"$ref": f"#/components/schemas/{m.__name__}"}
 
+    def model_ref_any(m: type):
+        if isinstance(m, type) and issubclass(m, Model):
+            seen.add(m)
+            return {"$ref": f"#/components/schemas/{m.__name__}"}
+        if is_pydantic_model_class(m):
+            name = m.__name__
+            if name not in components["schemas"]:
+                components["schemas"][name] = pydantic_model_json_schema(m)
+            return {"$ref": f"#/components/schemas/{name}"}
+        return _schema_for_param(m, components, seen)
+
     def ensure():
         queue = list(seen)
         done = set()
@@ -28,12 +43,15 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
             if model in done:
                 continue
             done.add(model)
-            components["schemas"][model.__name__] = model_to_json_schema(model)
-            for _, tp in getattr(model, "__annotations__", {}).items():
-                for nested in _find_models(tp):
-                    if nested not in done:
-                        seen.add(nested)
-                        queue.append(nested)
+            if isinstance(model, type) and issubclass(model, Model):
+                components["schemas"][model.__name__] = model_to_json_schema(model)
+                for _, tp in getattr(model, "__annotations__", {}).items():
+                    for nested in _find_models(tp):
+                        if nested not in done:
+                            seen.add(nested)
+                            queue.append(nested)
+            elif is_pydantic_model_class(model):
+                components["schemas"][model.__name__] = pydantic_model_json_schema(model)
 
     paths = {}
     used_operation_ids: set[str] = set()
@@ -78,6 +96,9 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
         body_media_types: set[str] = set()
         has_files = False
         request_media_type: str | None = None
+        body_description: str | None = None
+        body_example: Any = None
+        body_examples: dict[str, Any] | None = None
 
         for p in route.param_specs:
             if p.kind in ("request", "dep"):
@@ -93,6 +114,8 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
             ann = str if (p.annotation is inspect._empty or p.annotation is None) else p.annotation
             if kind in ("form", "file"):
                 schema = _schema_for_param(ann, components, seen)
+                if p.kind == "param" and p.param is not None and p.param.schema:
+                    schema = dict(p.param.schema)
                 if kind == "file":
                     has_files = True
                 form_props[param_name] = schema
@@ -100,17 +123,38 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
                     form_required.append(param_name)
                 continue
             if kind == "body":
-                schema = model_ref(ann) if (isinstance(ann, type) and issubclass(ann, Model)) else _schema_for_param(ann, components, seen)
+                schema = model_ref_any(ann)
+                if p.kind == "param" and p.param is not None and p.param.schema:
+                    schema = dict(p.param.schema)
+                if p.kind == "param" and p.param is not None:
+                    if p.param.description:
+                        body_description = p.param.description
+                    if p.param.example is not None:
+                        body_example = p.param.example
+                    if p.param.examples:
+                        body_examples = p.param.examples
                 body_props[param_name] = schema
                 mt = (p.param.media_type if p.param is not None and p.param.media_type else "application/json")
                 body_media_types.add(mt)
                 if p.default is inspect._empty:
                     body_required.append(param_name)
                 continue
-            schema = model_ref(ann) if (isinstance(ann, type) and issubclass(ann, Model)) else _schema_for_param(ann, components, seen)
+            schema = model_ref_any(ann)
+            if p.kind == "param" and p.param is not None and p.param.schema:
+                schema = dict(p.param.schema)
             in_kind = "header" if kind == "host" else kind
             pname = "host" if kind == "host" else param_name
-            params.append({"name": pname, "in": in_kind, "required": (kind == "path") or (p.default is inspect._empty), "schema": schema})
+            param_obj = {"name": pname, "in": in_kind, "required": (kind == "path") or (p.default is inspect._empty), "schema": schema}
+            if p.kind == "param" and p.param is not None:
+                if p.param.description:
+                    param_obj["description"] = p.param.description
+                if p.param.example is not None:
+                    param_obj["example"] = p.param.example
+                if p.param.examples:
+                    param_obj["examples"] = p.param.examples
+                if p.param.deprecated:
+                    param_obj["deprecated"] = True
+            params.append(_parameter_ref_or_inline(param_obj, components, reuse=reuse_params))
 
         if params:
             operation["parameters"] = params
@@ -139,10 +183,20 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
             operation["requestBody"] = {"required": required, "content": content}
         elif route.request_body_model is not None:
             request_media_type = "application/json"
-            operation["requestBody"] = {"required": True, "content": {request_media_type: {"schema": model_ref(route.request_body_model)}}}
+            operation["requestBody"] = {"required": True, "content": {request_media_type: {"schema": model_ref_any(route.request_body_model)}}}
         elif route.request_body_type is not None:
             request_media_type = "application/json"
             operation["requestBody"] = {"required": True, "content": {request_media_type: {"schema": _schema_for_param(route.request_body_type, components, seen)}}}
+
+        if "requestBody" in operation:
+            if body_description:
+                operation["requestBody"]["description"] = body_description
+            if body_example is not None:
+                for _mt, item in operation["requestBody"].get("content", {}).items():
+                    item.setdefault("example", body_example)
+            if body_examples:
+                for _mt, item in operation["requestBody"].get("content", {}).items():
+                    item.setdefault("examples", body_examples)
 
         if route.responses:
             for code, payload in route.responses.items():
@@ -154,8 +208,8 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
 
         default_desc = route.response_description or "OK"
         success_code = str(route.status_code if route.status_code is not None else 200)
-        if route.response_model is not None and isinstance(route.response_model, type) and issubclass(route.response_model, Model):
-            operation["responses"][success_code] = {"description": default_desc, "content": {"application/json": {"schema": model_ref(route.response_model)}}}
+        if route.response_model is not None and ((isinstance(route.response_model, type) and issubclass(route.response_model, Model)) or is_pydantic_model_class(route.response_model)):
+            operation["responses"][success_code] = {"description": default_desc, "content": {"application/json": {"schema": model_ref_any(route.response_model)}}}
         elif success_code not in operation["responses"]:
             operation["responses"][success_code] = {"description": default_desc}
 
@@ -175,6 +229,8 @@ def build_openapi(app, *, title="TurboAPI", version="0.1.0") -> Dict[str, Any]:
 
     ensure()
     _install_error_schemas(components)
+    if not components["parameters"]:
+        components.pop("parameters", None)
     if not components["securitySchemes"]:
         components.pop("securitySchemes", None)
 
@@ -206,6 +262,8 @@ def _find_models(tp) -> Set[type]:
     out = set()
     if isinstance(tp, type) and issubclass(tp, Model):
         out.add(tp)
+    if is_pydantic_model_class(tp):
+        out.add(tp)
     for a in getattr(tp, "__args__", ()) or ():
         out |= _find_models(a)
     return out
@@ -220,6 +278,11 @@ def _schema_for_param_impl(tp: Any, components: dict[str, Any], seen: set[type])
         if issubclass(tp, Model):
             seen.add(tp)
             return {"$ref": f"#/components/schemas/{tp.__name__}"}
+        if is_pydantic_model_class(tp):
+            name = tp.__name__
+            if name not in components["schemas"]:
+                components["schemas"][name] = pydantic_model_json_schema(tp)
+            return {"$ref": f"#/components/schemas/{name}"}
         if _is_typed_dict_cls(tp) or _is_dataclass_cls(tp):
             name = tp.__name__
             if name not in components["schemas"]:
@@ -245,13 +308,21 @@ def _apply_route_examples(operation: dict[str, Any], examples: dict[str, Any] | 
 
     request_examples = examples.get("request")
     if request_examples is not None and "requestBody" in operation:
-        media = request_media_type or "application/json"
         content = operation["requestBody"].setdefault("content", {})
-        media_obj = content.setdefault(media, {})
-        if isinstance(request_examples, dict):
-            media_obj["examples"] = request_examples
+        if isinstance(request_examples, dict) and any("/" in str(k) for k in request_examples.keys()):
+            for media, data in request_examples.items():
+                media_obj = content.setdefault(str(media), {})
+                if isinstance(data, dict):
+                    media_obj["examples"] = data
+                else:
+                    media_obj["example"] = data
         else:
-            media_obj["example"] = request_examples
+            media = request_media_type or "application/json"
+            media_obj = content.setdefault(media, {})
+            if isinstance(request_examples, dict):
+                media_obj["examples"] = request_examples
+            else:
+                media_obj["example"] = request_examples
 
     response_examples = examples.get("responses")
     if isinstance(response_examples, dict):
@@ -259,11 +330,19 @@ def _apply_route_examples(operation: dict[str, Any], examples: dict[str, Any] | 
             code_key = str(code)
             response_obj = operation["responses"].setdefault(code_key, {"description": "Response"})
             content = response_obj.setdefault("content", {})
-            media_obj = content.setdefault("application/json", {})
-            if isinstance(value, dict):
-                media_obj["examples"] = value
+            if isinstance(value, dict) and any("/" in str(k) for k in value.keys()):
+                for media, data in value.items():
+                    media_obj = content.setdefault(str(media), {})
+                    if isinstance(data, dict):
+                        media_obj["examples"] = data
+                    else:
+                        media_obj["example"] = data
             else:
-                media_obj["example"] = value
+                media_obj = content.setdefault("application/json", {})
+                if isinstance(value, dict):
+                    media_obj["examples"] = value
+                else:
+                    media_obj["example"] = value
 
     extra = {k: v for k, v in examples.items() if k not in {"request", "responses"}}
     if extra:
@@ -320,6 +399,18 @@ def _unique_operation_id(base: str, used: set[str]):
         idx += 1
     used.add(candidate)
     return candidate
+
+
+def _parameter_ref_or_inline(param_obj: dict[str, Any], components: dict[str, Any], *, reuse: bool):
+    if not reuse:
+        return param_obj
+    key_payload = json.dumps(param_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha1(key_payload.encode("utf-8")).hexdigest()[:12]
+    name = f"param_{digest}"
+    params = components.setdefault("parameters", {})
+    if name not in params:
+        params[name] = param_obj
+    return {"$ref": f"#/components/parameters/{name}"}
 
 def _install_error_schemas(components: dict[str, Any]):
     schemas = components.setdefault("schemas", {})

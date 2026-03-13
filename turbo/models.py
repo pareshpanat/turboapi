@@ -10,6 +10,7 @@ from typing import Annotated, Any, Dict, Literal, Optional, Union, get_args, get
 from uuid import UUID
 
 from .errors import HTTPError
+from .pydantic_compat import is_pydantic_model_class, validate_pydantic_model
 
 _MISSING = object()
 
@@ -20,13 +21,18 @@ class FieldInfo:
     max_len: Optional[int] = None
     ge: Optional[float] = None
     le: Optional[float] = None
+    gt: Optional[float] = None
+    lt: Optional[float] = None
+    multiple_of: Optional[float] = None
+    min_items: Optional[int] = None
+    max_items: Optional[int] = None
     regex: Optional[str] = None
     discriminator: Optional[str] = None
     alias: Optional[str] = None
 
 
-def field(*, min_len=None, max_len=None, ge=None, le=None, regex=None, discriminator=None, alias=None) -> Any:
-    return FieldInfo(min_len=min_len, max_len=max_len, ge=ge, le=le, regex=regex, discriminator=discriminator, alias=alias)
+def field(*, min_len=None, max_len=None, ge=None, le=None, gt=None, lt=None, multiple_of=None, min_items=None, max_items=None, regex=None, discriminator=None, alias=None) -> Any:
+    return FieldInfo(min_len=min_len, max_len=max_len, ge=ge, le=le, gt=gt, lt=lt, multiple_of=multiple_of, min_items=min_items, max_items=max_items, regex=regex, discriminator=discriminator, alias=alias)
 
 
 def field_validator(*field_names: str, mode: str = "after"):
@@ -165,6 +171,22 @@ def _collect_model_validators(model_cls: type[Model]):
 
 
 _VALIDATOR_CACHE: Dict[type, Any] = {}
+_TYPE_VALIDATORS: dict[type, dict[str, list[Any]]] = {}
+
+
+def type_validator(tp: type, *, mode: str = "after"):
+    mode = mode.lower().strip()
+    if mode not in ("before", "after"):
+        raise ValueError("type_validator mode must be 'before' or 'after'")
+    if not isinstance(tp, type):
+        raise TypeError("type_validator target must be a type")
+
+    def deco(fn):
+        bucket = _TYPE_VALIDATORS.setdefault(tp, {"before": [], "after": []})
+        bucket[mode].append(fn)
+        return fn
+
+    return deco
 
 
 def compile_model_validator(model_cls: type[Model]):
@@ -281,6 +303,10 @@ def compile_model_validator(model_cls: type[Model]):
 def compile_type_validator(tp: Any):
     if isinstance(tp, type) and issubclass(tp, Model):
         return compile_model_validator(tp)
+    if is_pydantic_model_class(tp):
+        def _validate_pyd(data: Any, *, loc_prefix: tuple[Any, ...] = ("body",)):
+            return validate_pydantic_model(tp, data, loc_prefix=loc_prefix)
+        return _validate_pyd
 
     def validate(data: Any, *, loc_prefix: tuple[Any, ...] = ("body",)):
         return validate_value("body", data, tp, None, loc=list(loc_prefix))
@@ -336,25 +362,36 @@ def _validate_union(val: Any, tp: Any, loc: list[Any], fi: Optional[FieldInfo] =
         return validate_value("union", val, mapping[tag], None, loc=loc)
 
     errors = []
-    for arg in args:
+    for idx, arg in enumerate(args):
         try:
             return validate_value("union", val, arg, None, loc=loc)
         except HTTPError as exc:
             if exc.status != 422:
                 raise
             detail = exc.detail if isinstance(exc.detail, dict) else {}
-            errors.append(detail.get("errors", [{"loc": loc, "msg": exc.message, "type": "value_error"}]))
+            variant_errors = detail.get("errors", [{"loc": loc, "msg": exc.message, "type": "value_error"}])
+            errors.append({"variant": idx, "type": str(arg), "errors": variant_errors})
     _validation_error(loc, "Input does not match any union variant", "value_error.union", {"variants": errors})
 
 
 def validate_value(name: str, val: Any, tp: Any, fi: Optional[FieldInfo], *, loc: Optional[list[Any]] = None):
     path = list(loc or [name])
+    if isinstance(tp, type):
+        typed = _TYPE_VALIDATORS.get(tp)
+        if typed:
+            for fn in typed["before"]:
+                try:
+                    val = _invoke_callable(fn, val)
+                except Exception as exc:
+                    _validation_error(path, str(exc), "value_error.type_validator")
 
     if isinstance(tp, type) and issubclass(tp, Model):
         try:
             return compile_model_validator(tp)(val, loc_prefix=tuple(path))
         except HTTPError as exc:
             raise exc
+    if is_pydantic_model_class(tp):
+        return validate_pydantic_model(tp, val, loc_prefix=tuple(path))
     if _is_typed_dict_class(tp):
         return _validate_typed_dict(val, tp, path)
     if isinstance(tp, type) and is_dataclass(tp):
@@ -369,8 +406,22 @@ def validate_value(name: str, val: Any, tp: Any, fi: Optional[FieldInfo], *, loc
     if origin is list:
         if not isinstance(val, list):
             _validation_error(path, "Input should be a list", "type_error.list")
+        if fi:
+            if fi.min_items is not None and len(val) < fi.min_items:
+                _validation_error(path, "List has too few items", "value_error.list.min_items", {"min_items": fi.min_items})
+            if fi.max_items is not None and len(val) > fi.max_items:
+                _validation_error(path, "List has too many items", "value_error.list.max_items", {"max_items": fi.max_items})
         inner = args[0] if args else Any
-        return [validate_value(name, item, inner, None, loc=[*path, idx]) for idx, item in enumerate(val)]
+        out = [validate_value(name, item, inner, None, loc=[*path, idx]) for idx, item in enumerate(val)]
+        if isinstance(tp, type):
+            typed = _TYPE_VALIDATORS.get(tp)
+            if typed:
+                for fn in typed["after"]:
+                    try:
+                        out = _invoke_callable(fn, out)
+                    except Exception as exc:
+                        _validation_error(path, str(exc), "value_error.type_validator")
+        return out
     if origin is dict:
         if not isinstance(val, dict):
             _validation_error(path, "Input should be an object", "type_error.object")
@@ -410,7 +461,22 @@ def validate_value(name: str, val: Any, tp: Any, fi: Optional[FieldInfo], *, loc
                 _validation_error(path, "Value too small", "value_error.number.not_ge", {"ge": fi.ge})
             if fi.le is not None and val > fi.le:
                 _validation_error(path, "Value too large", "value_error.number.not_le", {"le": fi.le})
-        return val
+            if fi.gt is not None and val <= fi.gt:
+                _validation_error(path, "Value too small", "value_error.number.not_gt", {"gt": fi.gt})
+            if fi.lt is not None and val >= fi.lt:
+                _validation_error(path, "Value too large", "value_error.number.not_lt", {"lt": fi.lt})
+            if fi.multiple_of is not None and (val % fi.multiple_of) != 0:
+                _validation_error(path, "Value is not a multiple", "value_error.number.multiple_of", {"multiple_of": fi.multiple_of})
+        out = val
+        if isinstance(tp, type):
+            typed = _TYPE_VALIDATORS.get(tp)
+            if typed:
+                for fn in typed["after"]:
+                    try:
+                        out = _invoke_callable(fn, out)
+                    except Exception as exc:
+                        _validation_error(path, str(exc), "value_error.type_validator")
+        return out
 
     if tp is float:
         if not isinstance(val, (int, float)) or isinstance(val, bool):
@@ -421,7 +487,22 @@ def validate_value(name: str, val: Any, tp: Any, fi: Optional[FieldInfo], *, loc
                 _validation_error(path, "Value too small", "value_error.number.not_ge", {"ge": fi.ge})
             if fi.le is not None and num > fi.le:
                 _validation_error(path, "Value too large", "value_error.number.not_le", {"le": fi.le})
-        return num
+            if fi.gt is not None and num <= fi.gt:
+                _validation_error(path, "Value too small", "value_error.number.not_gt", {"gt": fi.gt})
+            if fi.lt is not None and num >= fi.lt:
+                _validation_error(path, "Value too large", "value_error.number.not_lt", {"lt": fi.lt})
+            if fi.multiple_of is not None and (num / fi.multiple_of) % 1 != 0:
+                _validation_error(path, "Value is not a multiple", "value_error.number.multiple_of", {"multiple_of": fi.multiple_of})
+        out = num
+        if isinstance(tp, type):
+            typed = _TYPE_VALIDATORS.get(tp)
+            if typed:
+                for fn in typed["after"]:
+                    try:
+                        out = _invoke_callable(fn, out)
+                    except Exception as exc:
+                        _validation_error(path, str(exc), "value_error.type_validator")
+        return out
 
     if tp is Decimal:
         try:
@@ -434,7 +515,20 @@ def validate_value(name: str, val: Any, tp: Any, fi: Optional[FieldInfo], *, loc
                 _validation_error(path, "Value too small", "value_error.number.not_ge", {"ge": fi.ge})
             if fi.le is not None and num > fi.le:
                 _validation_error(path, "Value too large", "value_error.number.not_le", {"le": fi.le})
-        return dec
+            if fi.gt is not None and num <= fi.gt:
+                _validation_error(path, "Value too small", "value_error.number.not_gt", {"gt": fi.gt})
+            if fi.lt is not None and num >= fi.lt:
+                _validation_error(path, "Value too large", "value_error.number.not_lt", {"lt": fi.lt})
+        out = dec
+        if isinstance(tp, type):
+            typed = _TYPE_VALIDATORS.get(tp)
+            if typed:
+                for fn in typed["after"]:
+                    try:
+                        out = _invoke_callable(fn, out)
+                    except Exception as exc:
+                        _validation_error(path, str(exc), "value_error.type_validator")
+        return out
 
     if tp is bool:
         if not isinstance(val, bool):
@@ -473,7 +567,16 @@ def validate_value(name: str, val: Any, tp: Any, fi: Optional[FieldInfo], *, loc
         except ValueError:
             _validation_error(path, "Invalid UUID format", "value_error.uuid")
 
-    return val
+    out = val
+    if isinstance(tp, type):
+        typed = _TYPE_VALIDATORS.get(tp)
+        if typed:
+            for fn in typed["after"]:
+                try:
+                    out = _invoke_callable(fn, out)
+                except Exception as exc:
+                    _validation_error(path, str(exc), "value_error.type_validator")
+    return out
 
 
 def model_to_json_schema(model_cls: type[Model]) -> Dict[str, Any]:
@@ -532,7 +635,13 @@ def type_to_schema(tp: Any, fi: Optional[FieldInfo]) -> Dict[str, Any]:
         return {"enum": vals}
     if origin is list:
         inner = args[0] if args else Any
-        return {"type": "array", "items": type_to_schema(inner, None)}
+        schema = {"type": "array", "items": type_to_schema(inner, None)}
+        if fi:
+            if fi.min_items is not None:
+                schema["minItems"] = fi.min_items
+            if fi.max_items is not None:
+                schema["maxItems"] = fi.max_items
+        return schema
     if origin is dict:
         inner = args[1] if len(args) == 2 else Any
         return {"type": "object", "additionalProperties": type_to_schema(inner, None)}
@@ -563,6 +672,12 @@ def type_to_schema(tp: Any, fi: Optional[FieldInfo]) -> Dict[str, Any]:
                 schema["minimum"] = fi.ge
             if fi.le is not None:
                 schema["maximum"] = fi.le
+            if fi.gt is not None:
+                schema["exclusiveMinimum"] = fi.gt
+            if fi.lt is not None:
+                schema["exclusiveMaximum"] = fi.lt
+            if fi.multiple_of is not None:
+                schema["multipleOf"] = fi.multiple_of
         return schema
     if tp is float:
         schema = {"type": "number"}
@@ -571,6 +686,12 @@ def type_to_schema(tp: Any, fi: Optional[FieldInfo]) -> Dict[str, Any]:
                 schema["minimum"] = fi.ge
             if fi.le is not None:
                 schema["maximum"] = fi.le
+            if fi.gt is not None:
+                schema["exclusiveMinimum"] = fi.gt
+            if fi.lt is not None:
+                schema["exclusiveMaximum"] = fi.lt
+            if fi.multiple_of is not None:
+                schema["multipleOf"] = fi.multiple_of
         return schema
     if tp is Decimal:
         schema = {"type": "string", "format": "decimal"}
